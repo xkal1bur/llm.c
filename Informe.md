@@ -5,9 +5,18 @@ Integrantes:
 - Arturo Magno Barrantes Chuquimia (100%)
 - Andrea Fernanda Coa Cruz (100%)
 
+## Introducción
+
+Este proyecto se centra en la paralelización del entrenamiento de un Modelo de Lenguaje Grande (LLM) GPT-2, utilizando: `train_gpt2.c` para entornos de CPU con paralelismo OpenMP, y `train_gpt2.cu` para entornos de GPU con paralelismo CUDA y soporte distribuido usando MPI.
+
+La versión `train_gpt2.c` implementa el *forward* y *backward pass* de la arquitectura GPT-2 en C puro usando directivas OpenMP, por ejemplo, se usó `#pragma omp parallel for collapse(N)` para paralelizar bucles intensivos en cómputo.
+
+Por otro lado, `train_gpt2.cu` es una adaptación CUDA de la implementación en C. Esta traslada las operaciones a la GPU apoyándose optimizaciones a nivel de GPU. Esta versión incorpora la integración con MPI (`MPI_Init`, `MPI_Finalize`) y la biblioteca NCCL (NVIDIA Collective Communications Library) para la comunicación colectiva y la reducción de gradientes (`multi_gpu_async_reduce_gradient`). Esto permite el entrenamiento distribuido del modelo en múltiples GPUs y nodos, mejorando su escalabilidad en el training.
+
 ## Código/PRAM
 
-El código es un *fork* del repositorio [llm.c](https://github.com/karpathy/llm.c) de [Andrej Karpathy](https://github.com/karpathy), diseñado para implementar el LLM GPT-2 de forma minimalista. El proyecto incluye varias implementaciones, destacando aquellas en CUDA para el entrenamiento distribuido y en C para el entrenamiento secuencial en un solo nodo. Para el análisis de algoritmos paralelos, se empleó el modelo PRAM (Parallel Random Access Machine).
+El código es un *fork* del repositorio [llm.c](https://github.com/karpathy/llm.c) de [Andrej Karpathy](https://github.com/karpathy), diseñado para implementar el LLM GPT-2 de forma minimalista. El proyecto incluye varias implementaciones, destacando aquellas en CUDA (para entrenamiento distribuido) y en C (para entrenamiento secuencial y en un solo nodo). Para el análisis de algoritmos paralelos, se empleó el modelo PRAM (Parallel Random Access Machine).
+
 
 ## Aportes Adicionales
 
