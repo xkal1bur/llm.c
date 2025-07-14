@@ -1476,6 +1476,11 @@ int main(int argc, char *argv[]) {
             gpt2_forward(&model, train_loader.inputs, B, T);
             gpt2_backward_and_reduce(&model, train_loader.inputs, train_loader.targets, grad_accum_steps, micro_step);
         }
+        float local_loss = model.mean_loss;
+        float global_loss = 0.0f;
+        MPI_Allreduce(&local_loss, &global_loss, 1, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
+        global_loss /= multi_gpu_config.num_processes;
+        model.mean_loss = global_loss;
         float zloss = (float)(update_detector(&loss_outlier_detector, (double)model.mean_loss));
         float step_learning_rate = get_learning_rate(&lr_scheduler, step);
         float grad_norm = gpt2_calculate_grad_norm(&model, &multi_gpu_config);
