@@ -1499,7 +1499,9 @@ int main(int argc, char *argv[]) {
         float computation_time_ms;
         cudaCheck(cudaEventElapsedTime(&computation_time_ms, start, end));
         double total_host_time_ms = (mpi_end_time - mpi_start_time) * 1000.0;
-        double communication_time_ms = total_host_time_ms > computation_time_ms ? total_host_time_ms - computation_time_ms : 0.0;
+        double communication_time_ms = (multi_gpu_config.num_processes == 1) ? 0.0 :
+                                (total_host_time_ms > computation_time_ms ?
+                                total_host_time_ms - computation_time_ms : 0.0);
         size_t tokens_processed = (size_t)multi_gpu_config.num_processes * B * T * grad_accum_steps;
         float tokens_per_second = tokens_processed / (computation_time_ms / 1000.0f);
         float bias_corrected_ema_tokens_per_second = tokens_per_second;
