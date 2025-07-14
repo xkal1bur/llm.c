@@ -17,6 +17,85 @@ Por otro lado, `train_gpt2.cu` es una adaptación CUDA de la implementación en 
 
 El código es un *fork* del repositorio [llm.c](https://github.com/karpathy/llm.c) de [Andrej Karpathy](https://github.com/karpathy), diseñado para implementar el LLM GPT-2 de forma minimalista. El proyecto incluye varias implementaciones, destacando aquellas en CUDA (para entrenamiento distribuido) y en C (para entrenamiento secuencial y en un solo nodo). Para el análisis de algoritmos paralelos, se empleó el modelo PRAM (Parallel Random Access Machine).
 
+### GPU
+
+### CPU
+Se utilizaron directivas OMP en el proyecto para las secciones de cómputo más pesadas, aprovechando el paralelismo a nivel de CPU sin modificar demasiado la lógica base del modelo. A continuación, se resume cómo y por qué se hizo:
+
+Definimos:
+
+- B = batch_size, 
+- T = sequence_length, 
+- C = channels, 
+- V = vocab_size
+- S = number_of_steps 
+
+```plaintext
+for (int step = 0 to S) do {
+
+    1. Get next batch ----------------------------------
+        1.1. Read B * T tokens (input_ids and targets) from data source.
+
+    2. Forward pass (gpt2_forward) ---------------------
+        2.1. Encoder forward:
+             - Add Token Embeddings (wte) and Positional Embeddings (wpe) to form input to Transformer blocks. (B*T*C)
+
+        2.2. For each Transformer block (layer = 0 to NL-1):
+             2.2.1. Layer Normalization forward (B*T*C)
+             2.2.2. Linear projection for Attention (QKV):
+                    - matmul_forward (B*T) -> PARALLELIZED over B*T
+             2.2.3. Attention forward:
+                    - Scaled Dot-Product Attention (B*T*NH) -> PARALLELIZED over B*T*NH
+             2.2.4. Residual connection (B*T*C)
+             2.2.5. Layer Normalization forward (B*T*C)
+             2.2.6. MLP first linear layer:
+                    - matmul_forward (B*T) -> PARALLELIZED over B*T
+             2.2.7. GELU activation (B*T*C)
+             2.2.8. MLP second linear layer:
+                    - matmul_forward (B*T) -> PARALLELIZED over B*T
+             2.2.9. Residual connection (B*T*C)
+
+        2.3. Final Layer Normalization forward (B*T*C)
+        2.4. Final Linear layer (to logits):
+             - matmul_forward (B*T) -> PARALLELIZED over B*T (output is B*T*V)
+        2.5. Cross-entropy loss forward (calculates loss based on logits and targets)
+
+    3. Backward pass (gpt2_backward) --------------------
+        3.1. Cross-entropy softmax backward (calculates initial gradients from loss) (B*T*V)
+        3.2. Final Linear layer backward:
+             - matmul_backward:
+               - Gradients w.r.t. input (dinp) -> PARALLELIZED over B*T
+               - Gradients w.r.t. weights/bias (dweight/dbias) -> PARALLELIZED over OC
+
+        3.3. Final Layer Normalization backward (B*T*C)
+
+        3.4. For each Transformer block (layer = NL-1 down to 0):
+             3.4.1. Residual backward (B*T*C)
+             3.4.2. MLP second linear layer backward:
+                    - matmul_backward:
+                      - Gradients w.r.t. input (dinp) -> PARALLELIZED over B*T
+                      - Gradients w.r.t. weights/bias (dweight/dbias) -> PARALLELIZED over OC
+             3.4.3. GELU activation backward (B*T*C)
+             3.4.4. MLP first linear layer backward:
+                    - matmul_backward:
+                      - Gradients w.r.t. input (dinp) -> PARALLELIZED over B*T
+                      - Gradients w.r.t. weights/bias (dweight/dbias) -> PARALLELIZED over OC
+             3.4.5. Layer Normalization backward (B*T*C)
+             3.4.6. Residual backward (B*T*C)
+             3.4.7. Attention backward (Note: not explicitly parallelized in provided code due to complexity)
+             3.4.8. Linear projection for Attention (QKV) backward:
+                    - matmul_backward:
+                      - Gradients w.r.t. input (dinp) -> PARALLELIZED over B*T
+                      - Gradients w.r.t. weights/bias (dweight/dbias) -> PARALLELIZED over OC
+             3.4.9. Layer Normalization backward (B*T*C)
+
+        3.5. Encoder backward (gradients w.r.t. token and positional embeddings) (B*T*C)
+
+    4. Parameter update (gpt2_update) --------------------
+        4.1. Update all model parameters (weights and biases) using AdamW optimizer. (Loop over num_parameters)
+
+}
+````
 
 ## Aportes Adicionales
 
