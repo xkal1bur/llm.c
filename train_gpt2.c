@@ -17,9 +17,8 @@ There will be other versions of this code that specialize it and make it fast.
 #include <time.h>
 #include <string.h>
 #include <unistd.h>
-#ifdef OMP
 #include <omp.h>
-#endif
+
 // our own utilities
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
 #include "llmc/utils.h"
@@ -28,9 +27,8 @@ There will be other versions of this code that specialize it and make it fast.
 // defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
 #include "llmc/dataloader.h"
 
-// ----------------------------------------------------------------------------
-// all the individual layers' forward and backward passes
-// B = batch_size, T = sequence_length, C = channels, V = vocab_size
+// ... (El resto del código de las capas, de gpt2_build_from_checkpoint a gpt2_free, permanece sin cambios) ...
+// ... (The rest of the code for the layers, from gpt2_build_from_checkpoint to gpt2_free, remains unchanged) ...
 
 void encoder_forward(float* out,
                    int* inp, float* wte, float* wpe,
@@ -1043,6 +1041,91 @@ void gpt2_free(GPT2 *model) {
     free(model->targets);
 }
 
+//-----------------------------------------------------------------------------
+// Checkpointing
+
+void gpt2_save_checkpoint(GPT2 *model, const char* path, int step) {
+    // Abre el archivo en modo de escritura binaria
+    FILE *file = fopen(path, "wb");
+    if (file == NULL) {
+        printf("Error: No se pudo abrir el archivo de checkpoint para escritura: %s\n", path);
+        return;
+    }
+    // Prepara el encabezado del archivo
+    int header[256] = {0};
+    header[0] = 20240715; // Un número mágico para identificar nuestro tipo de archivo
+    header[1] = 1;        // Versión del checkpoint
+    header[2] = model->config.max_seq_len;
+    header[3] = model->config.vocab_size;
+    header[4] = model->config.num_layers;
+    header[5] = model->config.num_heads;
+    header[6] = model->config.channels;
+    header[7] = model->config.padded_vocab_size;
+    header[8] = step; // Guardamos el número del paso actual
+    
+    // Escribe el encabezado
+    fwrite(header, sizeof(int), 256, file);
+    // Escribe los parámetros del modelo
+    fwrite(model->params_memory, sizeof(float), model->num_parameters, file);
+    // Escribe el estado del optimizador (esencial para reanudar correctamente)
+    if (model->m_memory != NULL) {
+        fwrite(model->m_memory, sizeof(float), model->num_parameters, file);
+    }
+    if (model->v_memory != NULL) {
+        fwrite(model->v_memory, sizeof(float), model->num_parameters, file);
+    }
+    // Cierra el archivo
+    fclose(file);
+    printf("Checkpoint guardado en %s en el paso %d\n", path, step);
+}
+
+int gpt2_load_checkpoint(GPT2 *model, const char* path) {
+    // Abre el archivo del checkpoint para lectura binaria
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        printf("Error: No se pudo abrir el archivo de checkpoint para lectura: %s\n", path);
+        return -1;
+    }
+    // Lee y valida el encabezado
+    int header[256];
+    freadCheck(header, sizeof(int), 256, file);
+    if (header[0] != 20240715 || header[1] != 1) {
+        printf("Error: Archivo de checkpoint malo o versión incorrecta.\n");
+        fclose(file);
+        return -1;
+    }
+
+    // Lee la configuración del modelo desde el encabezado
+    GPT2Config config;
+    config.max_seq_len = header[2];
+    config.vocab_size = header[3];
+    config.num_layers = header[4];
+    config.num_heads = header[5];
+    config.channels = header[6];
+    config.padded_vocab_size = header[7];
+    int step = header[8]; // Obtiene el paso desde el que se reanuda
+
+    // Compara la configuración con la del modelo actual
+    if (memcmp(&model->config, &config, sizeof(GPT2Config)) != 0) {
+        printf("Error: La configuración del checkpoint no coincide con la del modelo.\n");
+        fclose(file);
+        return -1;
+    }
+
+    // Lee los parámetros y el estado del optimizador
+    freadCheck(model->params_memory, sizeof(float), model->num_parameters, file);
+    // Asegúrate de que la memoria para m y v esté alocada antes de leer en ella
+    if (model->m_memory == NULL) model->m_memory = (float*)calloc(model->num_parameters, sizeof(float));
+    if (model->v_memory == NULL) model->v_memory = (float*)calloc(model->num_parameters, sizeof(float));
+    freadCheck(model->m_memory, sizeof(float), model->num_parameters, file);
+    freadCheck(model->v_memory, sizeof(float), model->num_parameters, file);
+    
+    fclose(file);
+    printf("Checkpoint cargado desde %s en el paso %d\n", path, step);
+    return step;
+}
+
+
 #ifndef TESTING
 // if we are TESTING (see test_gpt2.c), we'll skip the int main below
 // ----------------------------------------------------------------------------
@@ -1075,20 +1158,39 @@ int sample_mult(float* probabilities, int n, float coin) {
 // ----------------------------------------------------------------------------
 // main training loop
 int main() {
+    // Inclusión de cabeceras para crear directorios
+    #include <sys/stat.h>
+    #include <sys/types.h>
 
-    // build the GPT-2 model from a checkpoint
+    // --- Lógica de Checkpoint ---
+    const char* checkpoint_dir = "seq_checkpoints";
+    mkdir(checkpoint_dir, 0777); // Crea el directorio, no hace nada si ya existe
+    char resume_checkpoint_path[256];
+    snprintf(resume_checkpoint_path, sizeof(resume_checkpoint_path), "%s/resume.bin", checkpoint_dir);
+    int start_step = 0;
+    
+    // Construye el modelo base primero para tener la configuración y la memoria alocada
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
 
-    // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
+    // Intenta reanudar desde el checkpoint si existe
+    if (access(resume_checkpoint_path, F_OK) != -1) {
+        int loaded_step = gpt2_load_checkpoint(&model, resume_checkpoint_path);
+        if (loaded_step != -1) {
+            start_step = loaded_step;
+        }
+    }
+    // --- Fin de la lógica de Checkpoint ---
+
+    // build the DataLoaders from tokens files
     const char* tiny_stories_train = "dev/data/tinystories/TinyStories_train.bin";
     const char* tiny_stories_val = "dev/data/tinystories/TinyStories_val.bin";
     const char* tiny_shakespeare_train = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char* tiny_shakespeare_val = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* train_tokens = access(tiny_shakespeare_train, F_OK) != -1 ? tiny_shakespeare_train : tiny_stories_train;
     const char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
-    int B = 4; // batch size 4 (i.e. 4 independent token sequences will be trained on)
-    int T = 64; // sequence length 64 (i.e. each sequence is 64 tokens long). must be <= maxT, which is 1024 for GPT-2
+    int B = 4;
+    int T = 64;
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, train_tokens, B, T, 0, 1, 1);
     dataloader_init(&val_loader, val_tokens, B, T, 0, 1, 0);
@@ -1103,13 +1205,26 @@ int main() {
     // some memory for generating samples from the model
     uint64_t rng_state = 1337;
     int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
-    const int genT = 64; // number of steps of inference we will do
+    const int genT = 64;
 
+    // ---- Archivo de Métricas ----
+    FILE *csv_file = fopen("sequential_metrics.csv", "a");
+    if (csv_file == NULL) {
+        printf("Error opening sequential_metrics.csv for writing.\n");
+        return 1;
+    }
+    fseek(csv_file, 0, SEEK_END);
+    long file_size = ftell(csv_file);
+    if (file_size == 0) {
+        fprintf(csv_file, "step,loss,computation_time_ms,communication_time_ms,total_time_ms,gflops_per_sec\n");
+    }
+    
     // train
-    struct timespec start, end;
-    for (int step = 0; step <= 40; step++) {
+    double start_time, end_time; // OMP timer variables
+    int max_steps = 40;
+    for (int step = start_step + 1; step <= max_steps; step++) {
 
-        // once in a while estimate the validation loss
+        // ... (El código de validación y generación de texto permanece igual) ...
         if (step % 10 == 0) {
             float val_loss = 0.0f;
             dataloader_reset(&val_loader);
@@ -1121,37 +1236,19 @@ int main() {
             val_loss /= val_num_batches;
             printf("val loss %f\n", val_loss);
         }
-
-        // once in a while do model inference to print generated text
         if (step > 0 && step % 20 == 0) {
-            // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
-            for(int i = 0; i < B * T; ++i) {
-                gen_tokens[i] = tokenizer.eot_token;
-            }
-            // now sample from the model autoregressively
+            for(int i = 0; i < B * T; ++i) { gen_tokens[i] = tokenizer.eot_token; }
             printf("generating:\n---\n");
             for (int t = 1; t < genT; t++) {
-                // note that inference is very wasteful here because for each token
-                // we re-calculate the forward pass for all of (B,T) positions from scratch
-                // but the inference here is just for sanity checking anyway
-                // and we can maybe optimize a bit more later, with careful tests
                 gpt2_forward(&model, gen_tokens, NULL, B, T);
-                // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
-                // we're in principle running B "inference streams" in parallel here
-                // but only using position 0
-                // get the Vp-dimensional vector probs[0, t-1, :]
                 float* probs = model.acts.probs + (t-1) * model.config.padded_vocab_size;
                 float coin = random_f32(&rng_state);
-                // note we're only sampling from the first V elements, ignoring padding
-                // (the probabilities in the padded region should be zero anyway)
                 int next_token = sample_mult(probs, model.config.vocab_size, coin);
                 gen_tokens[t] = next_token;
-                // print the generated token, either using the Tokenizer or a fallback
                 if (tokenizer.init_ok) {
                     const char* token_str = tokenizer_decode(&tokenizer, next_token);
                     safe_printf(token_str);
                 } else {
-                    // fall back to printing the token id
                     printf("%d ", next_token);
                 }
                 fflush(stdout);
@@ -1160,18 +1257,35 @@ int main() {
         }
 
         // do a training step
-        clock_gettime(CLOCK_MONOTONIC, &start);
+        start_time = omp_get_wtime();
         dataloader_next_batch(&train_loader);
         gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
         gpt2_zero_grad(&model);
         gpt2_backward(&model);
-        gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
-        clock_gettime(CLOCK_MONOTONIC, &end);
-        double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-        printf("step %d: train loss %f (took %f ms)\n", step, model.mean_loss, time_elapsed_s * 1000);
+        gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, step); // Usamos 'step' en lugar de 'step+1'
+        end_time = omp_get_wtime();
+        
+        // ---- Métricas y logging ----
+        double total_time_s = end_time - start_time;
+        double total_time_ms = total_time_s * 1000.0;
+        double computation_time_ms = total_time_ms;
+        double communication_time_ms = 0.0;
+        long long total_flops_per_step = 6LL * model.num_parameters * B * T;
+        double gflops_per_sec = total_time_s > 0 ? (total_flops_per_step / total_time_s) / 1e9 : 0.0;
+        printf("step %d: train loss %f (took %f ms, perf %.2f GFLOP/s)\n", step, model.mean_loss, total_time_ms, gflops_per_sec);
+        fprintf(csv_file, "%d,%f,%f,%f,%f,%f\n", step, model.mean_loss, computation_time_ms, communication_time_ms, total_time_ms, gflops_per_sec);
+        fflush(csv_file);
+        
+        // --- Guardar Checkpoint periódicamente ---
+        if (step % 10 == 0) {
+            gpt2_save_checkpoint(&model, resume_checkpoint_path, step);
+        }
     }
+    // Guardar un último checkpoint al final
+    gpt2_save_checkpoint(&model, resume_checkpoint_path, max_steps);
 
     // free
+    fclose(csv_file);
     dataloader_free(&train_loader);
     dataloader_free(&val_loader);
     tokenizer_free(&tokenizer);
