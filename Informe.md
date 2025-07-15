@@ -176,3 +176,21 @@ Durante el desarrollo de este proyecto, se realizaron los siguientes aportes sig
     * Se reconoció un modelo **CRCW (Concurrent Read, Concurrent Write)** en la acumulación de gradientes, donde varios procesadores pueden intentar escribir en la misma ubicación de memoria, requiriendo una regla de resolución de conflictos (como la suma aditiva de gradientes).
 * **Integración y Configuración de MPI**: En `train_gpt2.cu`, se incorporó la inicialización (`MPI_Init`) y finalización (`MPI_Finalize`) de MPI al inicio y al final de la ejecución, respectivamente, garantizando una correcta comunicación y coordinación entre los procesos distribuidos.
 * **Optimización del Rendimiento con NCCL**: Se profundizó en la comprensión y el uso práctico de la biblioteca NCCL (NVIDIA Collective Communications Library) para optimizar las operaciones de comunicación colectiva en entornos multi-GPU, lo que resultó en una mejora sustancial del rendimiento en aplicaciones CUDA.
+
+### Ejecución
+
+Para ejecutar ```train_gpt2.c``` usando OMP, primero obtener el dataset de Shakespeare.
+
+```bash
+chmod u+x ./dev/download_starter_pack.sh
+./dev/download_starter_pack.sh
+```
+
+Luego, compilar el código y ejecutar, especificando el número de hilos, Por ejemplo, para 8 hilos:
+
+```bash
+gcc -O2  -fopenmp train_gpt2.c -o train_gpt2 -lm
+OMP_NUM_THREADS=8 ./train_gpt2
+```
+
+Para ejecutr de forma secuencial, simplemente obviar ```-fopenmp``` y ```OMP_NUM_THREADS```.

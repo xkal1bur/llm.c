@@ -17,7 +17,12 @@ There will be other versions of this code that specialize it and make it fast.
 #include <time.h>
 #include <string.h>
 #include <unistd.h>
-#include <omp.h>
+// #include <omp.h>
+
+#ifdef _OPENMP
+    #include <omp.h>
+#endif
+
 
 // our own utilities
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
@@ -164,7 +169,9 @@ void matmul_forward_naive(float* out,
     // the most naive implementation of matrix multiplication
     // this serves as an algorithmic reference, and as a fallback for
     // unfriendly input shapes inside matmul_forward(), below.
+    #ifdef _OPENMP
     #pragma omp parallel for collapse(2)
+    #endif
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             int bt = b * T + t;
@@ -198,7 +205,9 @@ void matmul_forward(float* out,
 
     // collapse the B and T loops into one and turn it into a strided loop.
     // then we can tile the inner loop, and reuse the loaded weight LOOP_UNROLL many times
+    #ifdef _OPENMP
     #pragma omp parallel for
+    #endif
     for (int obt = 0; obt < B * T; obt += LOOP_UNROLL) {
         for (int o = 0; o < OC; o++) {
             // we'll keep LOOP_UNROLL many results in registers
@@ -234,7 +243,9 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
     // but that doesn't afford an efficient parallelization strategy
 
     // backward into inp first, parallelize over B,T
+    #ifdef _OPENMP
     #pragma omp parallel for collapse(2)
+    #endif
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             const float* dout_bt = dout + b * T * OC + t * OC;
@@ -249,7 +260,9 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
         }
     }
     // backward into weight/bias, parallelize over output channels OC
+    #ifdef _OPENMP
     #pragma omp parallel for
+    #endif
     for (int o = 0; o < OC; o++) {
         for (int b = 0; b < B; b++) {
             for (int t = 0; t < T; t++) {
@@ -280,7 +293,9 @@ void attention_forward(float* out, float* preatt, float* att,
     int hs = C / NH; // head size
     float scale = 1.0 / sqrtf(hs);
 
+    #ifdef _OPENMP
     #pragma omp parallel for collapse(3)
+    #endif
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             for (int h = 0; h < NH; h++) {
@@ -449,7 +464,9 @@ void softmax_forward(float* probs, float* logits, int B, int T, int V, int Vp) {
     // input: logits is (B,T,Vp) of the unnormalized log probabilities
     // Vp is the padded vocab size (for efficiency), V is the "real" vocab size
     // example: Vp is 50304 and V is 50257
+    #ifdef _OPENMP
     #pragma omp parallel for collapse(2)
+    #endif
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             // probs <- softmax(logits)
@@ -1155,15 +1172,51 @@ int sample_mult(float* probabilities, int n, float coin) {
     return n - 1; // in case of rounding errors
 }
 
+double get_time() {
+#ifdef _OPENMP
+    return omp_get_wtime();
+#else
+    // Fallback using POSIX clock_gettime (more precise than time())
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+#endif
+}
+
 // ----------------------------------------------------------------------------
 // main training loop
 int main() {
+
     // Inclusión de cabeceras para crear directorios
     #include <sys/stat.h>
     #include <sys/types.h>
+    int num_threads;
+
+#ifdef _OPENMP
+     #pragma omp parallel
+    {
+        // Print thread information
+        int thread_id = omp_get_thread_num();
+        printf("Hello from thread %d\n", thread_id);
+
+        // Only one thread (master) prints the total number of threads
+        #pragma omp single
+        {
+            num_threads = omp_get_num_threads();
+            printf("Number of threads being used: %d\n", num_threads);
+        }
+    }
+#endif
+
 
     // --- Lógica de Checkpoint ---
-    const char* checkpoint_dir = "seq_checkpoints";
+    char checkpoint_dir[64];
+    #ifndef _OPENMP
+        sprintf(checkpoint_dir, "seq_checkpoints");
+    #else
+        num_threads = omp_get_max_threads();
+        sprintf(checkpoint_dir, "%dthread_checkpoints", num_threads);
+    #endif
     mkdir(checkpoint_dir, 0777); // Crea el directorio, no hace nada si ya existe
     char resume_checkpoint_path[256];
     snprintf(resume_checkpoint_path, sizeof(resume_checkpoint_path), "%s/resume.bin", checkpoint_dir);
@@ -1208,9 +1261,17 @@ int main() {
     const int genT = 64;
 
     // ---- Archivo de Métricas ----
-    FILE *csv_file = fopen("sequential_metrics.csv", "a");
+    char metrics_filename[50];
+    #ifndef _OPENMP
+        // If _OMP is NOT defined → sequential
+        sprintf(metrics_filename, "OMP_seq.csv");
+    #else
+        num_threads = omp_get_max_threads();  // or omp_get_num_threads() inside parallel region
+        sprintf(metrics_filename, "OMP_%d.csv", num_threads);
+    #endif
+    FILE *csv_file = fopen(metrics_filename, "a");
     if (csv_file == NULL) {
-        printf("Error opening sequential_metrics.csv for writing.\n");
+        printf("Error opening %s for writing.\n", metrics_filename);
         return 1;
     }
     fseek(csv_file, 0, SEEK_END);
@@ -1257,13 +1318,13 @@ int main() {
         }
 
         // do a training step
-        start_time = omp_get_wtime();
+        start_time = get_time();
         dataloader_next_batch(&train_loader);
         gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
         gpt2_zero_grad(&model);
         gpt2_backward(&model);
         gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, step); // Usamos 'step' en lugar de 'step+1'
-        end_time = omp_get_wtime();
+        end_time = get_time();
         
         // ---- Métricas y logging ----
         double total_time_s = end_time - start_time;
