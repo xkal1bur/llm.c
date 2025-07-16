@@ -198,7 +198,22 @@ Para ejecutr de forma secuencial, simplemente obviar ```-fopenmp``` y ```OMP_NUM
 
 ## Gráficas
 
+Debido a la complejidad del cálculo de la cantidad de threads utilizados en el entrenamiento con GPU, utilizamos el placeholder 32 para representar la cantidad de hilos en las gráficas. Esto se debe a que el entrenamiento con GPU no se basa en un número fijo de hilos como en CPU, sino que utiliza una arquitectura de hilos más compleja y dinámica; esto está definido en los archivos ```llmc/*.cuh```.
+
+
+### Tiempo promedio por step vs. cantidad de hilos
+Se calculó el tiempo que tarda un step (un step considera el forward y backward pass) en promedio, y se graficó contra la cantidad de hilos utilizados. El tiempo incluye tanto el tiempo de cómputo como el de sincronización.
 ![Tiempo promedio por step por cantidad de hilos.](metrics_and_plots/avg_computation_time_with_gpu.png)
 
+
+### GFLOP/s promedio por step vs. cantidad de hilos
+Los GFLOP/s se calcularon como el número de operaciones de punto flotante realizadas por segundo durante el entrenamiento. Para ello, fue necesario conocer la cantidad de operaciones de punto flotante que sucede en cada step del entrenamiento. Esta cantidad ya está definida por la arquitectura del Transformer (el código original ya lo tenía), y está en la variable ```flops_per_step``` en la función ```gpt2_estimate_mfu``` de ```train_gpt2.cu```. Se graficó el promedio de GFLOP/s por step contra la cantidad de hilos utilizados.
 ![GFLOP/s promedio por step por cantidad de hilos.](metrics_and_plots/gflops_per_step_vs_threads.png)
+
+### Speedup por step vs. cantidad de hilos
+
+Finalmente, calculamos el speedup como la razón entre el tiempo promedio por step en la ejecución secuencial y el tiempo promedio por step con múltiples hilos. Se graficó el speedup contra la cantidad de hilos utilizados.
+
+Visualmente se ve proporcional a los GFLOP/s, lo cual es concordante con lo esperado por la teoría.
 ![Speedup por step por cantidad de hilos.](metrics_and_plots/speedup_vs_threads.png)
+

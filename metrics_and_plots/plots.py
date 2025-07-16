@@ -19,14 +19,14 @@ def extract_thread_count(filename):
     return None
 
 def read_and_average_computation_time(filename):
-    """Read CSV and compute average of computation_time_ms."""
+    """Read CSV and compute average of total_time_ms."""
     df = pd.read_csv(filename)
-    return df["computation_time_ms"].mean()
+    return df["total_time_ms"].mean()
 
 def compute_gflops_cpu(filename):
     """Compute average GFLOP/s per step for a CPU CSV using FLOP_PER_STEP and per-step time."""
     df = pd.read_csv(filename)
-    gflops_per_step = FLOP_PER_STEP / (df["computation_time_ms"] / 1000.0) / 1e9
+    gflops_per_step = FLOP_PER_STEP / (df["total_time_ms"] / 1000.0) / 1e9
     return gflops_per_step.mean()
 
 def compute_gflops_gpu(filename):
