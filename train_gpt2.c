@@ -1192,6 +1192,24 @@ int main() {
     #include <sys/types.h>
     int num_threads;
 
+    // Default values
+    int B = 4; // Batch size
+    char metrics_dir[128] = "."; // Default to current directory
+
+    // Parse command-line arguments
+    if (argc >= 2) {
+        B = atoi(argv[1]);
+    }
+    if (argc >= 3) {
+        strncpy(metrics_dir, argv[2], sizeof(metrics_dir) - 1);
+        metrics_dir[sizeof(metrics_dir) - 1] = '\0'; // Ensure null-termination
+    }
+    
+    printf("Using Batch Size: %d\n", B);
+    printf("Metrics directory: %s\n", metrics_dir);
+    mkdir(metrics_dir, 0777); // Create the directory if it doesn't exist
+
+
 #ifdef _OPENMP
      #pragma omp parallel
     {
@@ -1242,7 +1260,7 @@ int main() {
     const char* tiny_shakespeare_val = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* train_tokens = access(tiny_shakespeare_train, F_OK) != -1 ? tiny_shakespeare_train : tiny_stories_train;
     const char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
-    int B = 4;
+    // int B = 4;
     int T = 64;
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, train_tokens, B, T, 0, 1, 1);
@@ -1261,13 +1279,13 @@ int main() {
     const int genT = 64;
 
     // ---- Archivo de Métricas ----
-    char metrics_filename[50];
+    char metrics_filename[256]; // Increased buffer size for the full path
     #ifndef _OPENMP
         // If _OMP is NOT defined → sequential
-        sprintf(metrics_filename, "OMP_seq.csv");
+        sprintf(metrics_filename, "%s/OMP_seq.csv", metrics_dir);
     #else
         num_threads = omp_get_max_threads();  // or omp_get_num_threads() inside parallel region
-        sprintf(metrics_filename, "OMP_%d.csv", num_threads);
+        sprintf(metrics_filename, "%s/OMP_%d.csv", metrics_dir, num_threads);
     #endif
     FILE *csv_file = fopen(metrics_filename, "a");
     if (csv_file == NULL) {

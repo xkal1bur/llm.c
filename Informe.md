@@ -186,11 +186,11 @@ chmod u+x ./dev/download_starter_pack.sh
 ./dev/download_starter_pack.sh
 ```
 
-Luego, compilar el código y ejecutar, especificando el número de hilos, Por ejemplo, para 8 hilos:
+Luego, compilar el código y ejecutar, especificando el número de hilos, Por ejemplo, para 8 hilos, número de batches 4 y folder de outputs "my_outputs":
 
 ```bash
 gcc -O2  -fopenmp train_gpt2.c -o train_gpt2 -lm
-OMP_NUM_THREADS=8 ./train_gpt2
+OMP_NUM_THREADS=8 ./train_gpt2 4 my_outputs
 ```
 
 Para ejecutr de forma secuencial, simplemente obviar ```-fopenmp``` y ```OMP_NUM_THREADS```.
