@@ -1185,7 +1185,7 @@ double get_time() {
 
 // ----------------------------------------------------------------------------
 // main training loop
-int main() {
+int main(int argc, char *argv[]) {
 
     // Inclusión de cabeceras para crear directorios
     #include <sys/stat.h>
@@ -1261,7 +1261,7 @@ int main() {
     const char* train_tokens = access(tiny_shakespeare_train, F_OK) != -1 ? tiny_shakespeare_train : tiny_stories_train;
     const char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
     // int B = 4;
-    int T = 64;
+    int T = 256;
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, train_tokens, B, T, 0, 1, 1);
     dataloader_init(&val_loader, val_tokens, B, T, 0, 1, 0);
