@@ -9,7 +9,6 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include <string_view>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <mpi.h> // MODIFICACION: Incluir cabecera de MPI
 // ----------- CPU utilities -----------
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
 // defines: create_dir_if_not_exists, find_max_step, ends_with_bin
@@ -829,7 +828,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     cudaCheck(cudaMemset(dresidual, 0, B * T * C * sizeof(floatX)));
 
     // re-use the output buffer of the forward pass as a scratchpad during backward pass
-    float* scratchF = (float*)acts.output;
+    float*  scratchF = (float*)acts.output;
     floatX* scratchX = (floatX*)acts.output;
 
     // we kick off the chain rule by filling in dlosses with 1.0f/(B*T)
@@ -1125,15 +1124,30 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
 }
 
 float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
+    /*
+    Estimate model flops utilization (MFU)
+    ref: Section 2.1 of https://arxiv.org/pdf/2001.08361
+    Note: Ideally, the N here would be only the parameters that actually
+    participate in matrix multiplications. In this N, we are over-estimating by
+    including LayerNorm params, biases, and the position embedding weights,
+    but these are very small terms. Also keep in mind that we would want to exclude
+    the token embedding weights, but in GPT-2 these are weight shared, so they
+    participate in the classifier matmul, so they are correct to be included in N.
+    Note 2: The first term (6 * N) in flops_per_token is all weight matmuls, the
+    second is the attention matmul, which is also usually a small contribution.
+    */
     size_t N = model->num_parameters;
     int L = model->config.num_layers;
     int C = model->config.channels;
     int T = model->seq_len;
     size_t flops_per_token = 6 * N + (size_t)6 * L * C * T;
     size_t flops_per_step = flops_per_token * num_tokens;
-    float flops_achieved = (float)flops_per_step * (1.0f / dt);
+    // express our flops throughput as ratio of A100 bfloat16 peak flops
+    float flops_achieved = (float)flops_per_step * (1.0f / dt); // per second
     float flops_promised = get_flops_promised(deviceProp.name, PRECISION_MODE) * 1e12f;
-    if(flops_promised < 0) { return -1.f; }
+    if(flops_promised < 0) {
+        return -1.f;   // don't know
+    }
     float mfu = flops_achieved / flops_promised;
     return mfu;
 }
@@ -1153,15 +1167,30 @@ void gpt2_free(GPT2 *model) {
     free(model->bucket_info);
 }
 
+// ----------------------------------------------------------------------------
+// common init & free code for all of train/test/profile
+
 void common_start(bool override_enable_tf32 = true, bool print_device_info = true) {
+
+    // get CUDA device infos
     cudaCheck(cudaGetDeviceProperties(&deviceProp, multi_gpu_config.local_device_idx));
-    if (print_device_info) { printf("[System]\n"); printf("Device %d: %s\n", multi_gpu_config.local_device_idx, deviceProp.name); }
+    if (print_device_info) {
+        printf("[System]\n");
+        printf("Device %d: %s\n", multi_gpu_config.local_device_idx, deviceProp.name);
+    }
+
+    // set up the cuda streams. atm everything is on the single main stream
     cudaCheck(cudaStreamCreate(&main_stream));
     nvtxNameCudaStreamA(main_stream, "main stream");
+
+    // set up cuBLAS and cuBLASLt
     cublasCheck(cublasLtCreate(&cublaslt_handle));
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
+
+    // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
     bool enable_tf32 = PRECISION_MODE == PRECISION_FP32 && deviceProp.major >= 8 && override_enable_tf32;
     cublas_compute = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
+
     #ifdef ENABLE_CUDNN
     create_cudnn();
     #endif
@@ -1176,25 +1205,40 @@ void common_free(GPT2 &model) {
     #endif
 }
 
+
 void save_state(const char* filename, int step, GPT2* model, DataLoader* loader) {
     printf("Writing state to %s\n", filename);
     FILE *state_file = fopenCheck(filename, "wb");
     int state_header[256];
     memset(state_header, 0, sizeof(state_header));
-    state_header[0] = 20240527; state_header[1] = 1; state_header[2] = multi_gpu_config.num_processes;
-    state_header[3] = multi_gpu_config.process_rank; state_header[4] = model->use_master_weights;
-    state_header[5] = loader->should_shuffle; state_header[10] = step;
-    *((unsigned long long*)&state_header[20]) = model->rng_state;
-    *((unsigned long long*)&state_header[22]) = model->rng_state_last_update;
-    *((size_t*)&state_header[30]) = loader->current_shard_idx;
-    *((size_t*)&state_header[32]) = loader->current_sample_idx;
+    // basic identifying information
+    state_header[0] = 20240527; // magic number
+    state_header[1] = 1; // version number
+    state_header[2] = multi_gpu_config.num_processes; // number of processes
+    state_header[3] = multi_gpu_config.process_rank; // rank of this process
+    state_header[4] = model->use_master_weights;  // whether we're using fp32 master weights
+    state_header[5] = loader->should_shuffle; // shuffle state of the dataloader
+    // int main state, start at 10 to leave some padding
+    state_header[10] = step; // step of the optimization
+    // model rng state, start at 20 to leave some padding
+    *((unsigned long long*)&state_header[20]) = model->rng_state; // random number generator state
+    *((unsigned long long*)&state_header[22]) = model->rng_state_last_update; // last gpt2_update
+    // dataloader state, start at 30 to leave some padding
+    *((size_t*)&state_header[30]) = loader->current_shard_idx; // shard of the dataset
+    *((size_t*)&state_header[32]) = loader->current_sample_idx; // position in shard
     fwriteCheck(state_header, sizeof(int), 256, state_file);
+
+    // write AdamW m, v, and master_weights here (they are all float)
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
     device_to_file(state_file, model->m_memory, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
     device_to_file(state_file, model->v_memory, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
-    if(model->use_master_weights) { device_to_file(state_file, model->master_weights, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream); }
+    if(model->use_master_weights) {
+        device_to_file(state_file, model->master_weights, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+    }
+
+    // write dataloader state if we are using the Permuted version of it
     if (loader->should_shuffle) {
-        fwriteCheck(&loader->glob_result.gl_pathc, sizeof(size_t), 1, state_file);
+        fwriteCheck(&loader->glob_result.gl_pathc, sizeof(size_t), 1, state_file);  // number of shards
         fwriteCheck(loader->shard_indices, sizeof(int), loader->glob_result.gl_pathc, state_file);
         fwriteCheck(&loader->shard_num_samples, sizeof(size_t), 1, state_file);
         fwriteCheck(loader->intra_shard_indices, sizeof(int), loader->shard_num_samples, state_file);
@@ -1207,50 +1251,81 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     FILE *state_file = fopenCheck(filename, "rb");
     int state_header[256];
     freadCheck(state_header, sizeof(int), 256, state_file);
-    assert(state_header[0] == 20240527); assert(state_header[1] == 1);
-    assert(state_header[2] == multi_gpu_config.num_processes); assert(state_header[3] == multi_gpu_config.process_rank);
-    int use_master_weights = state_header[4]; int should_shuffle = state_header[5];
-    *step = state_header[10];
-    model->rng_state = *((unsigned long long*)&state_header[20]);
-    model->rng_state_last_update = *((unsigned long long*)&state_header[22]);
-    size_t current_shard_idx = *((size_t*)&state_header[30]);
-    size_t current_sample_idx = *((size_t*)&state_header[32]);
+    assert(state_header[0] == 20240527); // magic number
+    assert(state_header[1] == 1); // version number
+    assert(state_header[2] == multi_gpu_config.num_processes); // number of processes
+    assert(state_header[3] == multi_gpu_config.process_rank); // rank of this process
+    int use_master_weights = state_header[4];  // whether we're using fp32 master weights
+    int should_shuffle = state_header[5]; // shuffle state of the dataloader
+    *step = state_header[10]; // step of the optimization
+    model->rng_state = *((unsigned long long*)&state_header[20]); // random number generator state
+    model->rng_state_last_update = *((unsigned long long*)&state_header[22]); // last gpt2_update
+    size_t current_shard_idx = *((size_t*)&state_header[30]); // shard index
+    size_t current_sample_idx = *((size_t*)&state_header[32]); // position in shard
+
+    // read AdamW m, v, master_weights (they are all float)
+    // allocate all the needed memory as necessary
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
-    if(use_master_weights == 1 && !model->use_master_weights) { printf0("Warning: Master weights are present in state, but not enabled for current run."); }
-    else if (use_master_weights == 0 && model->use_master_weights) { printf0("Error: Master weights requested, but not present in state file."); exit(EXIT_FAILURE); }
-    model->init_state = false; assert(model->m_memory != nullptr); assert(model->v_memory != nullptr);
+    if(use_master_weights == 1 && !model->use_master_weights) {
+        printf0("Warning: Master weights are present in state, but not enabled for current run.");
+    } else if (use_master_weights == 0 && model->use_master_weights) {
+        printf0("Error: Master weights requested, but not present in state file.");
+        exit(EXIT_FAILURE);
+    }
+
+    model->init_state = false;      // we just got the state from file, no need to do first-touch init
+    assert(model->m_memory != nullptr);
+    assert(model->v_memory != nullptr);
     file_to_device(model->m_memory, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
     file_to_device(model->v_memory, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
     if(model->use_master_weights) {
         assert(model->master_weights != nullptr);
         file_to_device(model->master_weights, state_file, shard_num_parameters * sizeof(float), IO_BUF_SIZE, main_stream);
+        // restore weights from the master weights using the RNG state before last weight update
         model->rng_state = model->rng_state_last_update;
-        gpt2_update(model, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0, &multi_gpu_config, true);
-        model->rng_state = *((unsigned long long*)&state_header[20]);
+        gpt2_update(model, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0, &multi_gpu_config, /* init_from_master_only*/ true);
+        model->rng_state = *((unsigned long long*)&state_header[20]); // use final RNG state from checkpoint after this
     }
+
+    // revive the DataLoader object and its state
     loader->should_shuffle = should_shuffle;
     if (should_shuffle == 1) {
-        size_t glob_result_gl_pathc; freadCheck(&glob_result_gl_pathc, sizeof(size_t), 1, state_file); assert(glob_result_gl_pathc == loader->glob_result.gl_pathc);
+        // ensure the number of shards matches
+        size_t glob_result_gl_pathc;
+        freadCheck(&glob_result_gl_pathc, sizeof(size_t), 1, state_file);
+        assert(glob_result_gl_pathc == loader->glob_result.gl_pathc);
+        // read the shard indices
         loader->shard_indices = (int*)mallocCheck(loader->glob_result.gl_pathc * sizeof(int));
         freadCheck(loader->shard_indices, sizeof(int), loader->glob_result.gl_pathc, state_file);
-        size_t shard_num_samples; freadCheck(&shard_num_samples, sizeof(size_t), 1, state_file); assert(shard_num_samples == loader->shard_num_samples);
+        // ensure the number of samples matches
+        size_t shard_num_samples;
+        freadCheck(&shard_num_samples, sizeof(size_t), 1, state_file);
+        assert(shard_num_samples == loader->shard_num_samples);
+        // read the intra-shard indices
         loader->intra_shard_indices = (int*)mallocCheck(loader->shard_num_samples * sizeof(int));
         freadCheck(loader->intra_shard_indices, sizeof(int), loader->shard_num_samples, state_file);
+        // read the shuffle rng state
         freadCheck(&loader->shuffle_rng, sizeof(mt19937_state), 1, state_file);
     }
     dataloader_resume(loader, current_shard_idx, current_sample_idx);
+
+    // all done, close state file
     fcloseCheck(state_file);
 }
 
 void write_checkpoint(const char* output_log_dir, int step, GPT2* model, DataLoader* train_loader, MultiGpuConfig* multi_gpu_config) {
-    printf0("Writing checkpoint at step %d to %s\n", step, output_log_dir);
+    // a checkpoint contains: model weights, optimizer/dataloader state, and a DONE file
+    printf0("Writing checkpoint at step %d\n", step);
     int rank = multi_gpu_config->process_rank;
+    // only rank 0 writes the model file because it is the same across all ranks
     if (rank == 0) {
         snprintf(filename_buffer, sizeof(filename_buffer), "%s/model_%08d.bin", output_log_dir, step);
         gpt2_write_to_checkpoint(model, filename_buffer);
     }
+    // all ranks write their state file
     snprintf(filename_buffer, sizeof(filename_buffer), "%s/state_%08d_%05d.bin", output_log_dir, step, rank);
     save_state(filename_buffer, step, model, train_loader);
+    // DONE file is a signal that this checkpoint as a whole is complete
     multi_gpu_barrier(multi_gpu_config);
     if (rank == 0) {
         snprintf(filename_buffer, sizeof(filename_buffer), "%s/DONE_%08d", output_log_dir, step);
@@ -1260,7 +1335,8 @@ void write_checkpoint(const char* output_log_dir, int step, GPT2* model, DataLoa
 }
 
 void delete_checkpoint(const char* output_log_dir, int step, MultiGpuConfig* multi_gpu_config) {
-    printf0("Deleting checkpoint at step %d from %s\n", step, output_log_dir);
+    // mirrors write_checkpoint function, cleans up checkpoint from disk
+    printf0("Deleting checkpoint at step %d\n", step);
     int rank = multi_gpu_config->process_rank;
     if (rank == 0) {
         snprintf(filename_buffer, sizeof(filename_buffer), "%s/model_%08d.bin", output_log_dir, step);
@@ -1276,261 +1352,541 @@ void delete_checkpoint(const char* output_log_dir, int step, MultiGpuConfig* mul
 
 #ifndef TESTING
 // if we are TESTING (see test_gpt2.cu), we'll skip everything below this point
+
+// ----------------------------------------------------------------------------
+// training resumption logic, very useful when jobs crash once in a while
+// the goal is that we can resume optimization from any checkpoint, bit-perfect
+// note that "state" refers to things not already saved in the model checkpoint file
+
+// ----------------------------------------------------------------------------
+// CLI, poor man's argparse
+// (all single letters have been claimed now)
+
 void error_usage() {
     fprintf(stderr, "Usage:   ./train_gpt2cu [options]\n");
     fprintf(stderr, "Options:\n");
+    // file system input / output
     fprintf(stderr, "  -i <string> train data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_train.bin)\n");
     fprintf(stderr, "  -j <string> val data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_val.bin)\n");
     fprintf(stderr, "  -e <string> input .bin filename or descriptor, see code comments as docs. (default = gpt2_124M_bf16.bin)\n");
     fprintf(stderr, "  -o <string> output log dir (default = NULL, no logging)\n");
+    fprintf(stderr, "  -lg <int>   log gpu info every x steps (default = -1; disabled)\n");
     fprintf(stderr, "  -n <int>    write optimization checkpoints every how many steps? (default 0, don't)\n");
-    fprintf(stderr, "  -y <int>    resume optimization found inside checkpoint dir? (0=restart/overwrite, 1=resume/append)\n");
-    // ... (El resto de la ayuda de CLI permanece sin cambios) ...
+    fprintf(stderr, "  -nk <int>   max number of checkpoints to keep in the directory, removing old ones (0 = disable, default)\n");
+    fprintf(stderr, "  -nm <int>   every how many step checkpoints are considered major? major checkpoints never get deleted.\n");
+    fprintf(stderr, "  -y <int>    resume optimization found inside output log dir? (0=restart/overwrite, 1=resume/append)\n");
+    // token layout for each step of the optimization
+    fprintf(stderr, "  -b <int>    (per-GPU, micro) batch size B (default = 4)\n");
+    fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
+    fprintf(stderr, "  -d <int>    total desired batch size (default = B * T * num_processes, i.e. no grad accumulation\n");
+    // workload (number of steps)
+    fprintf(stderr, "  -x <int>    max_steps of optimization to run (-1 (default) = disable, run 1 epoch)\n");
+    // optimization
+    fprintf(stderr, "  -k <string> learning rate scheduler (default = cosine)\n");
+    fprintf(stderr, "  -l <float>  learning rate (default = 3e-4f)\n");
+    fprintf(stderr, "  -u <int>    learning rate warmup iterations (default = 0, no warmup)\n");
+    fprintf(stderr, "  -q <float>  learning rate decay: final fraction, at end of training (default = 1.0 (no decay))\n");
+    fprintf(stderr, "  -c <float>  weight decay (default = 0.0f)\n");
+    fprintf(stderr, "  -sl <float> outlier stability: skip update if loss goes above this in zscore (0.0f=off)\n");
+    fprintf(stderr, "  -sg <float> outlier stability: skip update if grad_norm goes above this in zscore (0.0f=off)\n");
+    // evaluation
+    fprintf(stderr, "  -v <int>    val_loss_every, how often we evaluate val loss (default = 20)\n");
+    fprintf(stderr, "  -m <int>    val_max_steps, up to how many val batches to estimate val loss? (default = 20)\n");
+    fprintf(stderr, "  -s <int>    sample_every, how often we inference the model (default = 20)\n");
+    fprintf(stderr, "  -g <int>    genT, how many steps of inference we do (default = 64)\n");
+    fprintf(stderr, "  -h <int>    hellaswag eval run? (default = 0)\n");
+    // debugging
+    fprintf(stderr, "  -a <int>    overfit a single batch? 0/1. useful for debugging\n");
+    // numerics
+    fprintf(stderr, "  -f <int>    enable_tf32 override (default: 1, set to 0 to disable tf32)\n");
+    fprintf(stderr, "  -w <int>    keep f32 copy of weights for the optimizer? (default: 1)\n");
+    fprintf(stderr, "  -ge <int>   gelu fusion: 0=none, 1=forward, 2=forward+backward (default: 2 for >=SM90, 0 for older GPUs)\n");
+    // memory management
+    fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
+    fprintf(stderr, "  -r <int>    recompute: less memory but less speed. (default = 1), 0|1|2 = none,gelu,gelu+ln\n");
+    // multi-node settings
+    fprintf(stderr, "  -pn <int>    num_processes (default = 1)\n");
+    fprintf(stderr, "  -pr <int>    process_rank (default = 0)\n");
+    fprintf(stderr, "  -pg <int>    gpus_per_node (default = 8)\n");
+    fprintf(stderr, "  -pm <string> nccl_init_method: tcp,fs,mpi (default = mpi)\n");
+    fprintf(stderr, "  -ps <string> server_ip - used only when nccl_init_method is tcp (default = -1)\n");
+    fprintf(stderr, "  -pp <string> fs_path - used only when nccl_init_method is fs (default = /tmp)\n");
     exit(EXIT_FAILURE);
 }
 
+// ----------------------------------------------------------------------------
+// main training loop
 int main(int argc, char *argv[]) {
-    MPI_Init(&argc, &argv);
-
+    // read in the (optional) command line arguments
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
-    const char* load_filename = "gpt2_124M_bf16.bin";
+    const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
     const char* lr_scheduler_type = "cosine";
     const char* output_log_dir = NULL;
-    const char* checkpoint_dir = "paralel_checkpoint";
-
-    int checkpoint_every = 0;
-    int checkpoints_keep = 0;
-    int major_checkpoint_every = 0;
-    int resume = 0;
-    int B = 4;
-    int T = 1024;
-    int total_batch_size = -1;
+    int checkpoint_every = 0; // write checkpoints every how many steps?
+    int checkpoints_keep = 0; // how long checkpoint history do we keep? (in units of checkpoints)
+    int major_checkpoint_every = 0; // major checkpoints never get deleted when maintaining history
+    int resume = 0; // resume the optimization, if one is found inside output_log_dir?
+    int B = 4; // batch size
+    int T = 1024; // sequence length max
+    int total_batch_size = -1; // will be calculated down below later, if not provided
     float learning_rate = 3e-4f;
     int log_gpu_every = -1;
     int warmup_iterations = 0;
-    float final_learning_rate_frac = 1.0f;
+    float final_learning_rate_frac = 1.0f; // final fraction of learning rate, at end of training
     float weight_decay = 0.0f;
-    float skip_update_lossz = 0.0f;
-    float skip_update_gradz = 0.0f;
-    int val_loss_every = 20;
-    int val_max_steps = 20;
-    int sample_every = 20;
-    int genT = 64;
-    int overfit_single_batch = 0;
+    float skip_update_lossz = 0.0f; // skip update if loss goes above this in zscore
+    float skip_update_gradz = 0.0f; // skip update if grad_norm goes above this in zscore
+    int val_loss_every = 20; // every how many steps do we eval validation loss?
+    int val_max_steps = 20; // how many batches max do we eval for validation loss?
+    int sample_every = 20; // every how many steps to do inference?
+    int genT = 64; // number of steps of inference we will do
+    int overfit_single_batch = 0; // useful for debugging, 1 = only load a single data batch once
     int max_steps = -1;
     int override_enable_tf32 = 1;
     int use_master_weights = 1;
-    int gelu_fusion = -1;
-    int recompute = 1;
-    int zero_stage = 0;
+    int gelu_fusion = -1; // 0 = none, 1 = forward, 2 = forward+backward (-1 => per-GPU default)
+    int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
+    int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
-    int num_processes = 1;
-    int process_rank = 0;
-    int gpus_per_node = 8;
-    char nccl_init_method[256] = "mpi";
-    char server_ip[256] = "";
-    char fs_path[256] = "";
-
+    // multi-node settings
+    int num_processes = 1;  // this should be set by the slurm environment
+    int process_rank = 0;  // this should be set by the slurm environment
+    int gpus_per_node = 8;  // this should be set by the slurm environment
+    char nccl_init_method[256] = "mpi";  // "tcp" or "fs" or "mpi"
+    char server_ip[256] = "";  // used if init_method set to "tcp" -> set to your server ip address
+    char fs_path[256] = "";  // used if init_method set to "fs" -> set to a shared filesystem path
     for (int i = 1; i < argc; i+=2) {
-        if (i + 1 >= argc) { error_usage(); } if (argv[i][0] != '-') { error_usage(); } if (!(strlen(argv[i]) == 2 || strlen(argv[i]) == 3)) { error_usage(); }
-        if (argv[i][1] == 'i') { train_data_pattern = argv[i+1]; } else if (argv[i][1] == 'j') { val_data_pattern = argv[i+1]; }
-        else if (argv[i][1] == 'e') { load_filename = argv[i+1]; } else if (argv[i][1] == 'o') { output_log_dir = argv[i+1]; }
-        else if (argv[i][1] == 'n' && argv[i][2] == '\0') { checkpoint_every = atoi(argv[i+1]); } else if (argv[i][1] == 'y') { resume = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'b') { B = atoi(argv[i+1]); } else if (argv[i][1] == 't') { T = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'd') { total_batch_size = atoi(argv[i+1]); } else if (argv[i][1] == 'l' && argv[i][2] == '\0') { learning_rate = atof(argv[i+1]); }
-        else if (argv[i][1] == 'l' && argv[i][2] == 'g') { log_gpu_every = atoi(argv[i+1]); } else if (argv[i][1] == 'u') { warmup_iterations = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'q') { final_learning_rate_frac = atof(argv[i+1]); } else if (argv[i][1] == 'c') { weight_decay = atof(argv[i+1]); }
-        else if (argv[i][1] == 'x') { max_steps = atoi(argv[i+1]); } else if (argv[i][1] == 'v') { val_loss_every = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'm') { val_max_steps = atoi(argv[i+1]); } else if (argv[i][1] == 's' && argv[i][2] == '\0') { sample_every = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'g' && argv[i][2] == 'e') { gelu_fusion = atoi(argv[i+1]); } else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'a') { overfit_single_batch = atoi(argv[i+1]); } else if (argv[i][1] == 'f') { override_enable_tf32 = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'w') { use_master_weights = atoi(argv[i+1]); } else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); } else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'k') { lr_scheduler_type = argv[i+1]; } else if (argv[i][1] == 'p' && argv[i][2] == 'i') { strcpy(nccl_init_method, argv[i+1]); }
-        else if (argv[i][1] == 'p' && argv[i][2] == 'f') { strcpy(fs_path, argv[i+1]); } else if (argv[i][1] == 'p' && argv[i][2] == 's') { strcpy(server_ip, argv[i+1]); }
-        else if (argv[i][1] == 'p' && argv[i][2] == 'n') { num_processes = atoi(argv[i+1]); } else if (argv[i][1] == 'p' && argv[i][2] == 'r') { process_rank = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'p' && argv[i][2] == 'g') { gpus_per_node = atoi(argv[i+1]); } else if (argv[i][1] == 's' && argv[i][2] == 'l') { skip_update_lossz = atof(argv[i+1]); }
-        else if (argv[i][1] == 's' && argv[i][2] == 'g') { skip_update_gradz = atof(argv[i+1]); } else if (argv[i][1] == 'n' && argv[i][2] == 'k') { checkpoints_keep = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'n' && argv[i][2] == 'm') { major_checkpoint_every = atoi(argv[i+1]); } else { error_usage(); }
+        if (i + 1 >= argc) { error_usage(); } // must have arg after flag
+        if (argv[i][0] != '-') { error_usage(); } // must start with dash
+        if (!(strlen(argv[i]) == 2 || strlen(argv[i]) == 3)) { error_usage(); } // must be -x[y] (one dash, one or two letters)
+        // read in the args
+        if (argv[i][1] == 'i') { train_data_pattern = argv[i+1]; }
+        else if (argv[i][1] == 'j') { val_data_pattern = argv[i+1]; }
+        else if (argv[i][1] == 'e') { load_filename = argv[i+1]; }
+        else if (argv[i][1] == 'o') { output_log_dir = argv[i+1]; }
+        else if (argv[i][1] == 'n' && argv[i][2] == '\0') { checkpoint_every = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'y') { resume = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'b') { B = atoi(argv[i+1]); } // Per-GPU (micro) batch size
+        else if (argv[i][1] == 't') { T = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'd') { total_batch_size = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'l' && argv[i][2] == '\0') { learning_rate = atof(argv[i+1]); }
+        else if (argv[i][1] == 'l' && argv[i][2] == 'g') { log_gpu_every = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'u') { warmup_iterations = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'q') { final_learning_rate_frac = atof(argv[i+1]); }
+        else if (argv[i][1] == 'c') { weight_decay = atof(argv[i+1]); }
+        else if (argv[i][1] == 'x') { max_steps = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'v') { val_loss_every = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'm') { val_max_steps = atoi(argv[i+1]); }
+        else if (argv[i][1] == 's' && argv[i][2] == '\0') { sample_every = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'g' && argv[i][2] == 'e') { gelu_fusion = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'a') { overfit_single_batch = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'f') { override_enable_tf32 = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'w') { use_master_weights = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'k') { lr_scheduler_type = argv[i+1]; }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'i') { strcpy(nccl_init_method, argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'f') { strcpy(fs_path, argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 's') { strcpy(server_ip, argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'n') { num_processes = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'r') { process_rank = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'g') { gpus_per_node = atoi(argv[i+1]); }
+        else if (argv[i][1] == 's' && argv[i][2] == 'l') { skip_update_lossz = atof(argv[i+1]); }
+        else if (argv[i][1] == 's' && argv[i][2] == 'g') { skip_update_gradz = atof(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'k') { checkpoints_keep = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'm') { major_checkpoint_every = atoi(argv[i+1]); }
+        else { error_usage(); }
     }
 
     multi_gpu_config = multi_gpu_config_init(num_processes, process_rank, gpus_per_node, server_ip, fs_path, nccl_init_method);
-    common_start(override_enable_tf32, false);
+    common_start(override_enable_tf32, false); // common init code for train/test/profile
 
+    // should do a bit more error checking here
     assert(warmup_iterations >= 0);
-    int tokens_per_fwdbwd = B * T * multi_gpu_config.num_processes;
+    if (output_log_dir != NULL) {
+        assert(strlen(output_log_dir) < 400); // careful bunch of hardcoded snprintf around this
+    }
+    int tokens_per_fwdbwd = B * T * multi_gpu_config.num_processes; // one micro-batch processes this many tokens
+    // calculate sensible default for total batch size as assuming no gradient accumulation
     if (total_batch_size == -1) { total_batch_size = tokens_per_fwdbwd; }
-    if (gelu_fusion == -1) { gelu_fusion = 0; }
+    // in the future, we might want to set gelu fusion to 2 for SM90+ and 0 for other GPUs
+    if (gelu_fusion == -1) { gelu_fusion = 0; } // (deviceProp.major >= 9) ? 2 : 0; } // in gpt2_init_common for test_gpt2cu...
+    // calculate the number of gradient accumulation steps from the desired total batch size
     assert(total_batch_size % tokens_per_fwdbwd == 0);
     int grad_accum_steps = total_batch_size / tokens_per_fwdbwd;
+    // if we're only overfitting a single batch for debugging, let's overfit the first batch
+    // from val instead of train split, because val is smaller and faster. (train_gpt2.py does the same)
     if (overfit_single_batch == 1) { train_data_pattern = val_data_pattern; }
+    printf0("+-----------------------+----------------------------------------------------+\n");
+    printf0("| Parameter             | Value                                              |\n");
+    printf0("+-----------------------+----------------------------------------------------+\n");
+    printf0("| train data pattern    | %-50s |\n", train_data_pattern);
+    printf0("| val data pattern      | %-50s |\n", val_data_pattern);
+    printf0("| output log dir        | %-50s |\n", output_log_dir == NULL ? "NULL" : output_log_dir);
+    printf0("| checkpoint_every      | %-50d |\n", checkpoint_every);
+    printf0("| resume                | %-50d |\n", resume);
+    printf0("| micro batch size B    | %-50d |\n", B);
+    printf0("| sequence length T     | %-50d |\n", T);
+    printf0("| total batch size      | %-50d |\n", total_batch_size);
+    printf0("| LR scheduler          | %-50s |\n", lr_scheduler_type);
+    printf0("| learning rate (LR)    | %-50e |\n", learning_rate);
+    printf0("| warmup iterations     | %-50d |\n", warmup_iterations);
+    printf0("| final LR fraction     | %-50e |\n", final_learning_rate_frac);
+    printf0("| weight decay          | %-50e |\n", weight_decay);
+    printf0("| skip update lossz     | %-50f |\n", skip_update_lossz);
+    printf0("| skip update gradz     | %-50f |\n", skip_update_gradz);
+    printf0("| max_steps             | %-50d |\n", max_steps);
+    printf0("| val_loss_every        | %-50d |\n", val_loss_every);
+    printf0("| val_max_steps         | %-50d |\n", val_max_steps);
+    printf0("| sample_every          | %-50d |\n", sample_every);
+    printf0("| genT                  | %-50d |\n", genT);
+    printf0("| overfit_single_batch  | %-50d |\n", overfit_single_batch);
+    printf0("| use_master_weights    | %-50s |\n", use_master_weights ? "enabled" : "disabled");
+    printf0("| gelu_fusion           | %-50d |\n", gelu_fusion);
+    printf0("| recompute             | %-50d |\n", recompute);
+    printf0("+-----------------------+----------------------------------------------------+\n");
+    const char* precision_str = (PRECISION_MODE == PRECISION_FP32)
+                              ? (cublas_compute == CUBLAS_COMPUTE_32F_FAST_TF32 ? "TF32" : "FP32")
+                              : (PRECISION_MODE == PRECISION_FP16 ? "FP16" : "BF16");
+    printf0("| device                | %-50s |\n", deviceProp.name);
+    printf0("| peak TFlops           | %-50.1f |\n", get_flops_promised(deviceProp.name, PRECISION_MODE));
+    printf0("| precision             | %-50s |\n", precision_str);
+    printf0("+-----------------------+----------------------------------------------------+\n");
 
-    // --- MODIFICACION: Lógica de CSV ---
-    FILE* csv_file = NULL;
-    if (multi_gpu_config.process_rank == 0) {
-        char csv_filename[256];
-        snprintf(csv_filename, sizeof(csv_filename), "paralel_%dgpu_metrics.csv", multi_gpu_config.num_processes);
-        csv_file = fopen(csv_filename, "a");
-        if (csv_file == NULL) {
-            printf("Error abriendo archivo CSV para escritura.\n");
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
-        fseek(csv_file, 0, SEEK_END);
-        if (ftell(csv_file) == 0) {
-            fprintf(csv_file, "step,loss,computation_time_ms,communication_time_ms,total_host_time_ms,gflops_per_sec,mfu_percentage\n");
-        }
-    }
-    // --- FIN MODIFICACION ---
-
+    // figure out if we are going to be resuming the optimization
     int resuming = 0;
-    int resume_max_step = -1;
-    if (checkpoint_every > 0) {
-        resume_max_step = find_max_step(checkpoint_dir);
-    }
-    
-    if (resume == 1) {
+    // find the DONE file with the highest step count
+    int resume_max_step = find_max_step(output_log_dir);
+    if (resume == 1) { // is -y 1 resume flag set?
+        assert(output_log_dir != NULL);
         if (resume_max_step != -1) {
-            resuming = 1;
-            snprintf(filename_buffer, sizeof(filename_buffer), "%s/model_%08d.bin", checkpoint_dir, resume_max_step);
+            resuming = 1; // -y 1 is set, and we found a checkpoint we can resume from
+            snprintf(filename_buffer, sizeof(filename_buffer), "%s/model_%08d.bin", output_log_dir, resume_max_step);
         }
     }
 
+    // build the GPT-2 model
     GPT2 model;
     gpt2_init_common(&model);
     if (resuming == 1) {
+        // if `-y 1` was set, then we are resuming from the latest checkpoint
+        // if we are using master weights, we'll init them later inside load_state()
         bool weight_init = !use_master_weights;
         gpt2_build_from_checkpoint(&model, filename_buffer, weight_init);
     } else if (ends_with_bin(load_filename)) {
+        // otherwise, if this is a .bin file, we assume it's a model, let's init from it
         gpt2_build_from_checkpoint(&model, load_filename);
     } else {
+        // if it's not .bin, it could be a "special descriptor". This descriptor is used to
+        // construct GPT-2 / GPT-3 models in a convenient format. See the function for docs.
         gpt_build_from_descriptor(&model, load_filename);
     }
 
-    model.use_master_weights = use_master_weights; model.gelu_fusion = gelu_fusion; model.recompute = recompute;
+    model.use_master_weights = use_master_weights;
+    model.gelu_fusion = gelu_fusion;
+    model.recompute = recompute;
+    printf0("| weight init method    | %-50s |\n", resuming == 1 ? "intermediate checkpoint" : load_filename);
+    printf0("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
+    printf0("| vocab_size V          | %-50d |\n", model.config.vocab_size);
+    printf0("| padded_vocab_size Vp  | %-50d |\n", model.config.padded_vocab_size);
+    printf0("| num_layers L          | %-50d |\n", model.config.num_layers);
+    printf0("| num_heads NH          | %-50d |\n", model.config.num_heads);
+    printf0("| channels C            | %-50d |\n", model.config.channels);
+    printf0("| num_parameters        | %-50zu |\n", model.num_parameters);
+    printf0("+-----------------------+----------------------------------------------------+\n");
+
+    // build DataLoaders for both train and val
+    int permute_train_loader = (overfit_single_batch == 1) ? 0 : 1;
     DataLoader train_loader, val_loader;
-    dataloader_init(&train_loader, train_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, (overfit_single_batch == 1) ? 0 : 1);
+    dataloader_init(&train_loader, train_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, permute_train_loader);
     dataloader_init(&val_loader, val_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, 0);
-    int train_num_batches = max_steps;
-    if (train_num_batches == -1) { train_num_batches = train_loader.num_tokens / total_batch_size; }
-    int val_num_batches = val_max_steps;
-    if (val_num_batches == -1) { val_num_batches = val_loader.num_tokens / tokens_per_fwdbwd; }
+    // figure out the number of training steps we will run for
+    int train_num_batches = max_steps; // passed in from command line
+    if (train_num_batches == -1) {
+        // sensible default is to train for exactly one epoch
+        size_t ntok = train_loader.num_tokens;
+        // the number of (outer loop) steps each process should take for us to reach one epoch
+        train_num_batches = ntok / total_batch_size;
+    }
+    // figure out the number of validation steps to run for
+    int val_num_batches = val_max_steps; // passed in from command line
+    if (val_num_batches == -1) {
+        // sensible default is to evaluate the full validation split
+        size_t ntok = val_loader.num_tokens;
+        // note that unlike the training loop, there is no gradient accumulation inner loop here
+        val_num_batches = ntok / tokens_per_fwdbwd;
+    }
+    printf0("| train_num_batches     | %-50d |\n", train_num_batches);
+    printf0("| val_num_batches       | %-50d |\n", val_num_batches);
+    printf0("+-----------------------+----------------------------------------------------+\n");
+
+    // build an EvalLoader for HellaSwag
     EvalLoader eval_loader;
     const char* hellaswag_path = "dev/data/hellaswag/hellaswag_val.bin";
     const bool hellaswag_available = access(hellaswag_path, F_OK) == 0;
     const bool run_hellaswag = hellaswag_eval && hellaswag_available;
-    if (run_hellaswag) { evalloader_init(&eval_loader, hellaswag_path, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes); }
+    if (run_hellaswag) {
+        evalloader_init(&eval_loader, hellaswag_path, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
+    }
+    printf0("| run hellaswag         | %-50s |\n", run_hellaswag ? "yes" : "no");
+    printf0("+-----------------------+----------------------------------------------------+\n");
+
+    // pretty print in a table the multi-gpu configuration as well
     set_zero_configs(&multi_gpu_config, zero_stage, model.num_parameters);
-    if (multi_gpu_config.process_rank == 0 && output_log_dir != NULL) { create_dir_if_not_exists(output_log_dir); }
-    Logger logger; logger_init(&logger, output_log_dir, multi_gpu_config.process_rank, resume);
-    Tokenizer tokenizer; tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
-    LearningRateScheduler lr_scheduler; lr_scheduler_init(&lr_scheduler, lr_scheduler_type, learning_rate, warmup_iterations, train_num_batches, final_learning_rate_frac);
+    printf0("| num_processes         | %-50d |\n", multi_gpu_config.num_processes);
+    printf0("| zero_stage            | %-50d |\n", multi_gpu_config.zero_stage);
+    printf0("+-----------------------+----------------------------------------------------+\n");
+
+    // prints outside of pretty table to here and below
+    if (!hellaswag_available) {
+        printf0("HellaSwag eval not found at %s, skipping its evaluation\n", hellaswag_path);
+        printf0("You can run `python dev/data/hellaswag.py` to export and use it with `-h 1`.\n");
+    }
+    // more prints related to allocations from gpt2_build_from_checkpoint down here to not mess up our table above
+    printf0("num_parameters: %zu => bytes: %zu\n", model.num_parameters, model.num_parameters_bytes);
+    printf0("allocated %d MiB for model parameters\n", (int)round(model.num_parameters_bytes / (1024 * 1024)));
+    // few more prints for gradient accumulation math up above
+    printf0("batch_size B=%d * seq_len T=%d * num_processes=%d and total_batch_size=%d\n",
+            B, T, multi_gpu_config.num_processes, total_batch_size);
+    printf0("=> setting grad_accum_steps=%d\n", grad_accum_steps);
+
+    // set up logging
+    if (multi_gpu_config.process_rank == 0) { create_dir_if_not_exists(output_log_dir); }
+    Logger logger;
+    logger_init(&logger, output_log_dir, multi_gpu_config.process_rank, resume);
+
+    // set up the Tokenizer
+    Tokenizer tokenizer;
+    tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
+
+    // set up learning rate scheduler
+    LearningRateScheduler lr_scheduler;
+    lr_scheduler_init(&lr_scheduler, lr_scheduler_type, learning_rate,
+                      warmup_iterations, train_num_batches, final_learning_rate_frac);
+
+    // some memory for generating samples from the model
     int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
     floatX* cpu_logits_raw = (floatX*)mallocCheck(model.config.vocab_size * sizeof(floatX));
-    float* cpu_logits = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
+    float*  cpu_logits = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
 
+    // if we found a checkpoint to resume from, load the optimization state
     int step = 0;
     gpt2_allocate_state(&model, B, T);
     if (resuming == 1) {
-        snprintf(filename_buffer, sizeof(filename_buffer), "%s/state_%08d_%05d.bin", checkpoint_dir, resume_max_step, multi_gpu_config.process_rank);
+        snprintf(filename_buffer, sizeof(filename_buffer), "%s/state_%08d_%05d.bin", output_log_dir, resume_max_step, multi_gpu_config.process_rank);
         load_state(&step, &model, &train_loader, filename_buffer);
     }
 
+    // init an OutlierDetector the training loss
     OutlierDetector loss_outlier_detector, grad_norm_outlier_detector;
-    init_detector(&loss_outlier_detector); init_detector(&grad_norm_outlier_detector);
+    init_detector(&loss_outlier_detector);
+    init_detector(&grad_norm_outlier_detector);
+
+    // do some checks here before we kick off training
+    // cross-check the desired sequence length T with the model's max sequence length
+    if (T < model.config.max_seq_len) {
+        printf0("!!!!!!!!\n");
+        printf0("WARNING:\n");
+        printf0("- The training sequence length is: T=%d (set with -t)\n", T);
+        printf0("- The model's max sequence length is: max_seq_len=%d\n", model.config.max_seq_len);
+        printf0("You are attempting to train with a sequence length shorter than the model's max.\n");
+        printf0("This will lead to unused parameters in the wpe position embedding weights.\n");
+        printf0("If you know what you're doing you can ignore this warning.\n");
+        printf0("If you're like ???, you are most likely misconfiguring your training run.\n");
+        printf0("---> HINT: If you're training GPT-2 use -t 1024. If GPT-3, use -t 2048.\n");
+        printf0("!!!!!!!!\n");
+    }
+    // in any case, this must be true or we'd index beyond the model's wpe (position embedding table)
     assert(T <= model.config.max_seq_len);
-    
+
+    // train
     cudaEvent_t start, end;
     cudaCheck(cudaEventCreate(&start));
     cudaCheck(cudaEventCreate(&end));
-    double mpi_start_time, mpi_end_time;
     cudaCheck(cudaProfilerStart());
     double total_sum_iteration_time_s = 0.0;
     float ema_tokens_per_second = 0.0f;
-
     for (; step <= train_num_batches; step++) {
-        // Validation and text generation logic here...
+        NvtxRange step_range("Train step", step);
+
         int last_step = step == train_num_batches;
-        if (step % val_loss_every == 0 || last_step) { /* ... */ }
-        if (run_hellaswag && ((step > 0 && step % val_loss_every == 0) || last_step)) { /* ... */ }
-        if (multi_gpu_config.process_rank == 0 && sample_every > 0 && (step > 0 && (step % sample_every) == 0 || last_step)) { /* ... */ }
-        
-        if (checkpoint_every > 0 && ((step > 0 && step % checkpoint_every == 0) || last_step)) {
-            if (multi_gpu_config.process_rank == 0) { create_dir_if_not_exists(checkpoint_dir); }
-            multi_gpu_barrier(&multi_gpu_config);
-            write_checkpoint(checkpoint_dir, step, &model, &train_loader, &multi_gpu_config);
+
+        // once in a while estimate the validation loss (all processes collaborate)
+        if (step % val_loss_every == 0 || last_step) {
+            NvtxRange validation_range("validation");
+            float val_loss = 0.0f;
+            dataloader_reset(&val_loader);
+            for (int i = 0; i < val_num_batches; i++) {
+                dataloader_next_batch(&val_loader);
+                val_loss += gpt2_validate(&model, val_loader.inputs, val_loader.targets, B, T);
+            }
+            val_loss /= val_num_batches;
+            val_loss = multi_gpu_cpu_float_sum(val_loss, &multi_gpu_config) / multi_gpu_config.num_processes;
+            printf0("val loss %f\n", val_loss);
+            logger_log_val(&logger, step, val_loss);
+        }
+
+        // once in a while estimate HellaSwag accuracy (all processes collaborate)
+        if (run_hellaswag &&
+           ((step > 0 && step % val_loss_every == 0) || last_step)) {
+            NvtxRange evaluation_range("evaluation");
+            float eval_acc_norm = 0.0f;
+            evalloader_reset(&eval_loader);
+            for (int i = 0; i < eval_loader.num_batches; i++) {
+                if (i % 10 == 0) { printf("evaluating HellaSwag: %d/%d\r", i, eval_loader.num_batches); }
+                evalloader_next_batch(&eval_loader);
+                gpt2_validate(&model, eval_loader.inputs, eval_loader.targets, B, T);
+                int correct = evalloader_stat_losses(&eval_loader, model.cpu_losses);
+                eval_acc_norm += (float)correct;
+            }
+            // careful because not all ranks may have the exact same allocation of number of examples
+            eval_acc_norm = multi_gpu_cpu_float_sum(eval_acc_norm, &multi_gpu_config);
+            printf0("HellaSwag: %d/%d = %f\n", (int)eval_acc_norm, eval_loader.num_examples, eval_acc_norm / eval_loader.num_examples);
+            logger_log_eval(&logger, step, eval_acc_norm / eval_loader.num_examples);
+        }
+
+        // once in a while do model inference to print generated text (only rank 0)
+        if (multi_gpu_config.process_rank == 0 && sample_every > 0 &&
+           (step > 0 && (step % sample_every) == 0 || last_step)) {
+            NvtxRange generation_range("generation");
+            unsigned long long sample_rng_state = 1337;
+            // fill up gen_tokens with the <|endoftext|> token, which kicks off the generation
+            int eot_token = tokenizer.eot_token;
+            for(int i = 0; i < B * T; ++i) {
+                gen_tokens[i] = eot_token;
+            }
+            // now sample from the model autoregressively
+            printf("generating:\n---\n");
+            for (int t = 1; t < genT; t++) {
+                NvtxRange generation_range("Generation step", t);
+                // we try not to be too wasteful for inference by not calculating all of B,T
+                // Using a smaller B is always bit-for-bit identical, but T is more tricky
+                // for non-CUDNN, we need to make sure the attention buffer is memset to 0
+                // for cuDNN, it might suddenly decide to use a slightly different algorithm...
+                // on cuDNN 9.2.1 with cuDNN FrontEnd 1.5.2, T >= 256 seems bit-for-bit identical
+                // (but even if it wasn't fully identical that's probably not the end of the world)
+                // note this is still somewhat wasteful because we don't have a KV cache!
+                gpt2_forward(&model, gen_tokens, 1, CEIL_DIV(t, min(T,256)) * min(T,256));
+                // get the V-dimensional vector probs[0, t-1, :]
+                floatX* logits = model.acts.output + (t - 1) * model.config.padded_vocab_size;
+                // move probs back to CPU and sample (note we only move the first vocab_size logits, ignoring the padding)
+                cudaCheck(cudaMemcpy(cpu_logits_raw, logits, model.config.vocab_size * sizeof(floatX), cudaMemcpyDeviceToHost));
+                // convert to FP32 into cpu_logits (this does nothing useful if floatX == float)
+                for (int i = 0; i < model.config.vocab_size; i++) {
+                    cpu_logits[i] = (float)cpu_logits_raw[i];
+                }
+                // sample the next token
+                float coin = random_f32(&sample_rng_state);
+                int next_token = sample_softmax(cpu_logits, model.config.vocab_size, coin);
+                gen_tokens[t] = next_token;
+                // print the generated token, either using the Tokenizer or a fallback
+                if (tokenizer.init_ok) {
+                    const char* token_str = tokenizer_decode(&tokenizer, next_token);
+                    safe_printf(token_str);
+                } else {
+                    // fall back to printing the token id
+                    printf("%d ", next_token);
+                }
+                fflush(stdout);
+            }
+            printf("\n---\n");
+        }
+
+        // once in a while checkpoint the optimization state (all ranks)
+        if ((checkpoint_every > 0 && output_log_dir != NULL && resuming == 0) &&
+            ((step > 0 && step % checkpoint_every == 0) || last_step)) {
+            // writes model .bin file, state .bin files, and DONE file for step
+            write_checkpoint(output_log_dir, step, &model, &train_loader, &multi_gpu_config);
+            // we only keep checkpoints_keep checkpoints on disk to save space
+            // so now that we wrote a new checkpoint, delete one old one (unless it is a "major" checkpoint)
+            // we only do this is checkpoint keeping is turned on (checkpoints_keep > 0)
             int step_delete = step - checkpoints_keep * checkpoint_every;
-            if (checkpoints_keep > 0 && step_delete > 0 && (major_checkpoint_every == 0 || step_delete % major_checkpoint_every != 0)) {
-                delete_checkpoint(checkpoint_dir, step_delete, &multi_gpu_config);
+            if (checkpoints_keep > 0 && step_delete > 0 &&
+               (major_checkpoint_every == 0 || step_delete % major_checkpoint_every != 0)
+                ) {
+                delete_checkpoint(output_log_dir, step_delete, &multi_gpu_config);
             }
         }
         resuming = 0;
+
+        // bit confusing: we want to make sure to eval and sample on 0th iteration
+        // but also after the very last iteration. so we loop for step <= train_num_batches
+        // instead of just < train_num_batches (one extra due to <=), only to do
+        // the validation/sampling one last time, and then we break right here as we're done.
         if (last_step) { break; }
-        if (overfit_single_batch == 1) { dataloader_reset(&train_loader); }
-        
-        multi_gpu_barrier(&multi_gpu_config);
-        mpi_start_time = MPI_Wtime();
+
+        // --------------- TRAINING SECTION BEGIN -----------------
+        if (overfit_single_batch == 1) {
+            // if we are trying to overfit a single batch, we reset the loader here
+            dataloader_reset(&train_loader);
+        }
+        // do one training step, doing forward/backward/update on total_batch_size tokens
         cudaCheck(cudaEventRecord(start));
+        // gradient and loss accumulation loop over micro-batches
         for (int micro_step = 0; micro_step < grad_accum_steps; micro_step++) {
+            // fetch the next data batch
             dataloader_next_batch(&train_loader);
+            // forward pass. note that we pass in grad_accum_steps, which scales down the loss
             gpt2_forward(&model, train_loader.inputs, B, T);
+            // backward pass. all model params accumulate gradients with += inside this inner loop
             gpt2_backward_and_reduce(&model, train_loader.inputs, train_loader.targets, grad_accum_steps, micro_step);
         }
-        float local_loss = model.mean_loss;
-        float global_loss = 0.0f;
-        MPI_Allreduce(&local_loss, &global_loss, 1, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
-        global_loss /= multi_gpu_config.num_processes;
-        model.mean_loss = global_loss;
-        float zloss = (float)(update_detector(&loss_outlier_detector, (double)model.mean_loss));
+        float zloss = (float)(update_detector(&loss_outlier_detector, (double)model.mean_loss)); // loss z-score
+        // fetch the next learning rate
         float step_learning_rate = get_learning_rate(&lr_scheduler, step);
+        // calculate the gradient norm and how much we wish to scale the gradient
         float grad_norm = gpt2_calculate_grad_norm(&model, &multi_gpu_config);
-        float zgrad = (float)(update_detector(&grad_norm_outlier_detector, (double)grad_norm));
-        if (isfinite(zloss) && skip_update_lossz != 0.0f && zloss > skip_update_lossz) { printf0("skipping update due to loss z-score of %f\n", zloss); }
-        else if (isfinite(zgrad) && skip_update_gradz != 0.0f && zgrad > skip_update_gradz) { printf0("skipping update due to grad z-score of %f\n", zgrad); }
-        else {
+        float zgrad = (float)(update_detector(&grad_norm_outlier_detector, (double)grad_norm)); // grad z-score
+        // update the model parameters
+        if (isfinite(zloss) && skip_update_lossz != 0.0f && zloss > skip_update_lossz) {
+            printf0("skipping update due to loss z-score of %f\n", zloss);
+        } else if (isfinite(zgrad) && skip_update_gradz != 0.0f && zgrad > skip_update_gradz) {
+            printf0("skipping update due to grad z-score of %f\n", zgrad);
+        } else {
+            // clip the gradient norm to a maximum value
             float grad_clip = 1.0f;
             float grad_scale = (grad_norm > grad_clip) ? grad_clip / grad_norm : 1.0f;
             gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, grad_scale, step+1, &multi_gpu_config);
         }
         cudaCheck(cudaEventRecord(end));
-        cudaCheck(cudaEventSynchronize(end));
-        mpi_end_time = MPI_Wtime();
+        cudaCheck(cudaEventSynchronize(end)); // wait for the end event to finish to get correct timings
+        // --------------- TRAINING SECTION END -------------------
+        // everything that follows now is just diagnostics, prints, logging, etc.
 
-        float computation_time_ms;
-        cudaCheck(cudaEventElapsedTime(&computation_time_ms, start, end));
-        double total_host_time_ms = (mpi_end_time - mpi_start_time) * 1000.0;
-        double communication_time_ms = (multi_gpu_config.num_processes == 1) ? 0.0 :
-                                (total_host_time_ms > computation_time_ms ?
-                                total_host_time_ms - computation_time_ms : 0.0);
+        // todo - move or double-buffer all of this timing logic to avoid idling the GPU at this point!
+        float time_elapsed_ms;
+        cudaCheck(cudaEventElapsedTime(&time_elapsed_ms, start, end));
         size_t tokens_processed = (size_t)multi_gpu_config.num_processes * B * T * grad_accum_steps;
-        float tokens_per_second = tokens_processed / (computation_time_ms / 1000.0f);
-        float bias_corrected_ema_tokens_per_second = tokens_per_second;
-        if (step > 0) {
-            total_sum_iteration_time_s += computation_time_ms / 1000.0f;
+        float tokens_per_second = tokens_processed / time_elapsed_ms * 1000.0f;
+        float bias_corrected_ema_tokens_per_second = tokens_per_second; // by default set to non-ema version
+        if (step > 0) { // consider the first batch to be a warmup (e.g. cuBLAS/cuDNN initialisation)
+            total_sum_iteration_time_s += time_elapsed_ms / 1000.0f;
+            // smooth out the tok/s with an exponential moving average, and bias correct just like in AdamW
             ema_tokens_per_second = 0.95f * ema_tokens_per_second + 0.05f * tokens_per_second;
             bias_corrected_ema_tokens_per_second = ema_tokens_per_second / (1.0f - powf(0.95f, step));
         }
-        float mfu = gpt2_estimate_mfu(&model, B * T * grad_accum_steps, computation_time_ms / 1000.0f);
-        long long flops_per_token = 6LL * model.num_parameters + (size_t)6 * model.config.num_layers * model.config.channels * T;
-        long long total_flops_per_step = flops_per_token * B * T * grad_accum_steps;
-        double gflops_per_sec = (computation_time_ms > 0) ? (total_flops_per_step / (computation_time_ms / 1000.0)) / 1e9 : 0.0;
-
-        printf0("step %4d/%d | loss %7.6f | norm %6.4f | lr %.2e | comp_t %.2fms | comm_t %.2fms | mfu %.1f%% | tps %.0f\n",
-                step + 1, train_num_batches, model.mean_loss, grad_norm, step_learning_rate,
-                computation_time_ms, communication_time_ms, 100*mfu, bias_corrected_ema_tokens_per_second);
-
-        if (multi_gpu_config.process_rank == 0 && csv_file != NULL) {
-            fprintf(csv_file, "%d,%f,%f,%f,%f,%f,%f\n", step + 1, model.mean_loss, computation_time_ms, communication_time_ms, total_host_time_ms, gflops_per_sec, mfu*100);
-            fflush(csv_file);
+        float mfu = gpt2_estimate_mfu(&model, B * T * grad_accum_steps, time_elapsed_ms / 1000.0f);
+        printf0("step %4d/%d | loss %7.6f (%+.2fz)| norm %6.4f (%+.2fz)| lr %.2e | %.2f ms | %.1f%% bf16 MFU | %.0f tok/s\n",
+                step + 1, train_num_batches, model.mean_loss, zloss, grad_norm, zgrad, step_learning_rate,
+                time_elapsed_ms, 100*mfu, bias_corrected_ema_tokens_per_second);
+        if(log_gpu_every > 0 && (step + 1) % log_gpu_every == 0) {
+            GPUUtilInfo gpu_info = get_gpu_utilization_info();
+            printf0("                  compute %2.1f%% | memory: %2.1f%% | fan: %2d%% | %4d MHz / %4d MHz | %3d W / %3d W | %d°C / %d°C | %s\n",
+                    gpu_info.gpu_utilization, gpu_info.mem_utilization, gpu_info.fan, gpu_info.clock, gpu_info.max_clock, gpu_info.power / 1000, gpu_info.power_limit / 1000,
+                    gpu_info.temperature, gpu_info.temp_slowdown, gpu_info.throttle_reason);
         }
+        logger_log_train(&logger, step, model.mean_loss, step_learning_rate, grad_norm);
 
-        if (log_gpu_every > 0 && (step + 1) % log_gpu_every == 0) { /* ... */ }
+        // disable the profiler after 3 steps of optimization
         if (step == 3) { cudaProfilerStop(); }
     }
-    
+    // add a total average, for optimizations that are only mild improvements (excluding 1st batch as warmup)
     printf0("total average iteration time: %f ms\n", total_sum_iteration_time_s / (train_num_batches-1) * 1000);
 
-    if (multi_gpu_config.process_rank == 0 && csv_file != NULL) { fclose(csv_file); }
+    // free and destroy everything
     cudaCheck(cudaEventDestroy(end));
     cudaCheck(cudaEventDestroy(start));
     if (run_hellaswag) { evalloader_free(&eval_loader); }
@@ -1543,8 +1899,6 @@ int main(int argc, char *argv[]) {
     multi_gpu_config_free(&multi_gpu_config);
     gpt2_free(&model);
     common_free(model);
-    
-    MPI_Finalize();
     return 0;
 }
 #endif

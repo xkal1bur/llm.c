@@ -194,9 +194,6 @@ else
   endif
 endif
 
-NO_MULTI_GPU = 0
-NO_USE_MPI = 0
-
 # Check if NCCL is available, include if so, for multi-GPU training
 ifeq ($(NO_MULTI_GPU), 1)
   $(info → Multi-GPU (NCCL) is manually disabled)
