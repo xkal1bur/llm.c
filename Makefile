@@ -230,7 +230,7 @@ else
 endif
 
 # Precision settings, default to bf16 but ability to override
-PRECISION ?= BF16
+PRECISION ?= FP32
 VALID_PRECISIONS := FP32 FP16 BF16
 ifeq ($(filter $(PRECISION),$(VALID_PRECISIONS)),)
   $(error Invalid precision $(PRECISION), valid precisions are $(VALID_PRECISIONS))
@@ -270,7 +270,7 @@ test_gpt2: test_gpt2.c
 $(NVCC_CUDNN): llmc/cudnn_att.cpp
 	$(NVCC) -c $(NVCC_FLAGS) $(PFLAGS) $^ $(NVCC_INCLUDES) -o $@
 
-train_gpt2cu: train_gpt2.cu $(NVCC_CUDNN)
+train_gpt2cu: train_gpt2_3.cu $(NVCC_CUDNN)
 	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
 
 train_gpt2fp32cu: train_gpt2_fp32.cu
