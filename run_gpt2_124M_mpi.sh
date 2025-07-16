@@ -49,6 +49,6 @@ mpirun -np 2 --host $host1:1,$host2:1 \
     -u 0 \
     -n 0 \
     -y 0 \
-    -x 40 \
+    -x 11 \
     -e gpt2_124M.bin \
     -pi "mpi" \
