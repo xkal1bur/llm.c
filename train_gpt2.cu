@@ -1414,6 +1414,21 @@ void error_usage() {
     exit(EXIT_FAILURE);
 }
 
+void log_metrics_to_csv(const char* filename, int step, float loss, float computation_time_ms, float communication_time_ms, float total_time_ms, float gflops_per_sec) {
+    FILE* f = fopen(filename, "a");
+    if (f == NULL) {
+        printf("Error opening file %s for logging metrics.\n", filename);
+        return;
+    }
+    // If the file is empty, write the header
+    fseek(f, 0, SEEK_END);
+    if (ftell(f) == 0) {
+        fprintf(f, "step,loss,computation_time_ms,communication_time_ms,total_time_ms,gflops_per_sec\n");
+    }
+    fprintf(f, "%d,%f,%f,%f,%f,%f\n", step, loss, computation_time_ms, communication_time_ms, total_time_ms, gflops_per_sec);
+    fclose(f);
+}
+
 // ----------------------------------------------------------------------------
 // main training loop
 int main(int argc, char *argv[]) {
@@ -1653,6 +1668,10 @@ int main(int argc, char *argv[]) {
             B, T, multi_gpu_config.num_processes, total_batch_size);
     printf0("=> setting grad_accum_steps=%d\n", grad_accum_steps);
 
+    // calculate FLOPs per step here, before the loop!
+    size_t flops_per_step = (6 * model.num_parameters + (size_t)6 * model.config.num_layers * model.config.channels * T) * total_batch_size;
+    printf0("Total FLOPs per step: %zu\n", flops_per_step);
+
     // set up logging
     if (multi_gpu_config.process_rank == 0) { create_dir_if_not_exists(output_log_dir); }
     Logger logger;
@@ -1704,11 +1723,21 @@ int main(int argc, char *argv[]) {
 
     // train
     cudaEvent_t start, end;
+    cudaEvent_t comm_start, comm_end;
     cudaCheck(cudaEventCreate(&start));
     cudaCheck(cudaEventCreate(&end));
+    cudaCheck(cudaEventCreate(&comm_start));
+    cudaCheck(cudaEventCreate(&comm_end));
+
     cudaCheck(cudaProfilerStart());
     double total_sum_iteration_time_s = 0.0;
     float ema_tokens_per_second = 0.0f;
+
+    char metrics_filename[512];
+    if (output_log_dir != NULL) {
+        snprintf(metrics_filename, sizeof(metrics_filename), "%s/training_metrics.csv", output_log_dir);
+    }
+
     for (; step <= train_num_batches; step++) {
         NvtxRange step_range("Train step", step);
 
@@ -1742,7 +1771,6 @@ int main(int argc, char *argv[]) {
                 int correct = evalloader_stat_losses(&eval_loader, model.cpu_losses);
                 eval_acc_norm += (float)correct;
             }
-            // careful because not all ranks may have the exact same allocation of number of examples
             eval_acc_norm = multi_gpu_cpu_float_sum(eval_acc_norm, &multi_gpu_config);
             printf0("HellaSwag: %d/%d = %f\n", (int)eval_acc_norm, eval_loader.num_examples, eval_acc_norm / eval_loader.num_examples);
             logger_log_eval(&logger, step, eval_acc_norm / eval_loader.num_examples);
@@ -1753,41 +1781,22 @@ int main(int argc, char *argv[]) {
            (step > 0 && (step % sample_every) == 0 || last_step)) {
             NvtxRange generation_range("generation");
             unsigned long long sample_rng_state = 1337;
-            // fill up gen_tokens with the <|endoftext|> token, which kicks off the generation
             int eot_token = tokenizer.eot_token;
-            for(int i = 0; i < B * T; ++i) {
-                gen_tokens[i] = eot_token;
-            }
-            // now sample from the model autoregressively
+            for(int i = 0; i < B * T; ++i) { gen_tokens[i] = eot_token; }
             printf("generating:\n---\n");
             for (int t = 1; t < genT; t++) {
                 NvtxRange generation_range("Generation step", t);
-                // we try not to be too wasteful for inference by not calculating all of B,T
-                // Using a smaller B is always bit-for-bit identical, but T is more tricky
-                // for non-CUDNN, we need to make sure the attention buffer is memset to 0
-                // for cuDNN, it might suddenly decide to use a slightly different algorithm...
-                // on cuDNN 9.2.1 with cuDNN FrontEnd 1.5.2, T >= 256 seems bit-for-bit identical
-                // (but even if it wasn't fully identical that's probably not the end of the world)
-                // note this is still somewhat wasteful because we don't have a KV cache!
                 gpt2_forward(&model, gen_tokens, 1, CEIL_DIV(t, min(T,256)) * min(T,256));
-                // get the V-dimensional vector probs[0, t-1, :]
                 floatX* logits = model.acts.output + (t - 1) * model.config.padded_vocab_size;
-                // move probs back to CPU and sample (note we only move the first vocab_size logits, ignoring the padding)
                 cudaCheck(cudaMemcpy(cpu_logits_raw, logits, model.config.vocab_size * sizeof(floatX), cudaMemcpyDeviceToHost));
-                // convert to FP32 into cpu_logits (this does nothing useful if floatX == float)
-                for (int i = 0; i < model.config.vocab_size; i++) {
-                    cpu_logits[i] = (float)cpu_logits_raw[i];
-                }
-                // sample the next token
+                for (int i = 0; i < model.config.vocab_size; i++) { cpu_logits[i] = (float)cpu_logits_raw[i]; }
                 float coin = random_f32(&sample_rng_state);
                 int next_token = sample_softmax(cpu_logits, model.config.vocab_size, coin);
                 gen_tokens[t] = next_token;
-                // print the generated token, either using the Tokenizer or a fallback
                 if (tokenizer.init_ok) {
                     const char* token_str = tokenizer_decode(&tokenizer, next_token);
                     safe_printf(token_str);
                 } else {
-                    // fall back to printing the token id
                     printf("%d ", next_token);
                 }
                 fflush(stdout);
@@ -1798,11 +1807,7 @@ int main(int argc, char *argv[]) {
         // once in a while checkpoint the optimization state (all ranks)
         if ((checkpoint_every > 0 && output_log_dir != NULL && resuming == 0) &&
             ((step > 0 && step % checkpoint_every == 0) || last_step)) {
-            // writes model .bin file, state .bin files, and DONE file for step
             write_checkpoint(output_log_dir, step, &model, &train_loader, &multi_gpu_config);
-            // we only keep checkpoints_keep checkpoints on disk to save space
-            // so now that we wrote a new checkpoint, delete one old one (unless it is a "major" checkpoint)
-            // we only do this is checkpoint keeping is turned on (checkpoints_keep > 0)
             int step_delete = step - checkpoints_keep * checkpoint_every;
             if (checkpoints_keep > 0 && step_delete > 0 &&
                (major_checkpoint_every == 0 || step_delete % major_checkpoint_every != 0)
@@ -1812,66 +1817,84 @@ int main(int argc, char *argv[]) {
         }
         resuming = 0;
 
-        // bit confusing: we want to make sure to eval and sample on 0th iteration
-        // but also after the very last iteration. so we loop for step <= train_num_batches
-        // instead of just < train_num_batches (one extra due to <=), only to do
-        // the validation/sampling one last time, and then we break right here as we're done.
         if (last_step) { break; }
 
         // --------------- TRAINING SECTION BEGIN -----------------
         if (overfit_single_batch == 1) {
-            // if we are trying to overfit a single batch, we reset the loader here
             dataloader_reset(&train_loader);
         }
-        // do one training step, doing forward/backward/update on total_batch_size tokens
+
         cudaCheck(cudaEventRecord(start));
-        // gradient and loss accumulation loop over micro-batches
+        float communication_time_ms = 0.0f;
+
         for (int micro_step = 0; micro_step < grad_accum_steps; micro_step++) {
-            // fetch the next data batch
+            if (multi_gpu_config.process_rank == 0) { // Optional: log only from rank 0 to reduce clutter
+                printf("step %d, micro_step %d/%d\n", step, micro_step + 1, grad_accum_steps);
+                fflush(stdout); // IMPORTANT: This forces the output to print immediately
+            }
             dataloader_next_batch(&train_loader);
-            // forward pass. note that we pass in grad_accum_steps, which scales down the loss
             gpt2_forward(&model, train_loader.inputs, B, T);
-            // backward pass. all model params accumulate gradients with += inside this inner loop
+
+            cudaCheck(cudaEventRecord(comm_start));
             gpt2_backward_and_reduce(&model, train_loader.inputs, train_loader.targets, grad_accum_steps, micro_step);
+            cudaCheck(cudaEventRecord(comm_end));
+            cudaCheck(cudaEventSynchronize(comm_end));
+            float backward_comm_time;
+            cudaCheck(cudaEventElapsedTime(&backward_comm_time, comm_start, comm_end));
+            communication_time_ms += backward_comm_time;
         }
-        float zloss = (float)(update_detector(&loss_outlier_detector, (double)model.mean_loss)); // loss z-score
-        // fetch the next learning rate
+
+        float zloss = (float)(update_detector(&loss_outlier_detector, (double)model.mean_loss));
         float step_learning_rate = get_learning_rate(&lr_scheduler, step);
-        // calculate the gradient norm and how much we wish to scale the gradient
         float grad_norm = gpt2_calculate_grad_norm(&model, &multi_gpu_config);
-        float zgrad = (float)(update_detector(&grad_norm_outlier_detector, (double)grad_norm)); // grad z-score
-        // update the model parameters
+        float zgrad = (float)(update_detector(&grad_norm_outlier_detector, (double)grad_norm));
+
         if (isfinite(zloss) && skip_update_lossz != 0.0f && zloss > skip_update_lossz) {
             printf0("skipping update due to loss z-score of %f\n", zloss);
         } else if (isfinite(zgrad) && skip_update_gradz != 0.0f && zgrad > skip_update_gradz) {
             printf0("skipping update due to grad z-score of %f\n", zgrad);
         } else {
-            // clip the gradient norm to a maximum value
             float grad_clip = 1.0f;
             float grad_scale = (grad_norm > grad_clip) ? grad_clip / grad_norm : 1.0f;
-            gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, grad_scale, step+1, &multi_gpu_config);
-        }
-        cudaCheck(cudaEventRecord(end));
-        cudaCheck(cudaEventSynchronize(end)); // wait for the end event to finish to get correct timings
-        // --------------- TRAINING SECTION END -------------------
-        // everything that follows now is just diagnostics, prints, logging, etc.
 
-        // todo - move or double-buffer all of this timing logic to avoid idling the GPU at this point!
-        float time_elapsed_ms;
-        cudaCheck(cudaEventElapsedTime(&time_elapsed_ms, start, end));
+            cudaCheck(cudaEventRecord(comm_start));
+            gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, grad_scale, step+1, &multi_gpu_config);
+            cudaCheck(cudaEventRecord(comm_end));
+            cudaCheck(cudaEventSynchronize(comm_end));
+            float update_comm_time;
+            cudaCheck(cudaEventElapsedTime(&update_comm_time, comm_start, comm_end));
+            communication_time_ms += update_comm_time;
+        }
+
+        cudaCheck(cudaEventRecord(end));
+        cudaCheck(cudaEventSynchronize(end));
+        // --------------- TRAINING SECTION END -------------------
+
+        float total_time_ms;
+        cudaCheck(cudaEventElapsedTime(&total_time_ms, start, end));
+        float computation_time_ms = total_time_ms - communication_time_ms;
+
         size_t tokens_processed = (size_t)multi_gpu_config.num_processes * B * T * grad_accum_steps;
-        float tokens_per_second = tokens_processed / time_elapsed_ms * 1000.0f;
-        float bias_corrected_ema_tokens_per_second = tokens_per_second; // by default set to non-ema version
-        if (step > 0) { // consider the first batch to be a warmup (e.g. cuBLAS/cuDNN initialisation)
-            total_sum_iteration_time_s += time_elapsed_ms / 1000.0f;
-            // smooth out the tok/s with an exponential moving average, and bias correct just like in AdamW
+        float mfu = gpt2_estimate_mfu(&model, B * T * grad_accum_steps, total_time_ms / 1000.0f);
+        size_t flops_per_step = (6 * model.num_parameters + (size_t)6 * model.config.num_layers * model.config.channels * T) * tokens_processed;
+        float gflops_per_sec = (float)flops_per_step / (total_time_ms / 1000.0f) / 1e9f;
+        
+        float bias_corrected_ema_tokens_per_second = 0.0f;
+        if (step > 0) {
+            total_sum_iteration_time_s += total_time_ms / 1000.0;
+            float tokens_per_second = tokens_processed / (total_time_ms / 1000.0f);
             ema_tokens_per_second = 0.95f * ema_tokens_per_second + 0.05f * tokens_per_second;
             bias_corrected_ema_tokens_per_second = ema_tokens_per_second / (1.0f - powf(0.95f, step));
         }
-        float mfu = gpt2_estimate_mfu(&model, B * T * grad_accum_steps, time_elapsed_ms / 1000.0f);
-        printf0("step %4d/%d | loss %7.6f (%+.2fz)| norm %6.4f (%+.2fz)| lr %.2e | %.2f ms | %.1f%% bf16 MFU | %.0f tok/s\n",
+
+        printf0("step %4d/%d | loss %7.6f (%+.2fz) | norm %6.4f (%+.2fz) | lr %.2e | time %.2fms (comp %.2f, comm %.2f) | MFU %.1f%% | gflops/s %.2f | %.0f tok/s\n",
                 step + 1, train_num_batches, model.mean_loss, zloss, grad_norm, zgrad, step_learning_rate,
-                time_elapsed_ms, 100*mfu, bias_corrected_ema_tokens_per_second);
+                total_time_ms, computation_time_ms, communication_time_ms, 100 * mfu, gflops_per_sec, bias_corrected_ema_tokens_per_second);
+        
+        if (output_log_dir != NULL) {
+            log_metrics_to_csv(metrics_filename, step + 1, model.mean_loss, computation_time_ms, communication_time_ms, total_time_ms, gflops_per_sec);
+        }
+        
         if(log_gpu_every > 0 && (step + 1) % log_gpu_every == 0) {
             GPUUtilInfo gpu_info = get_gpu_utilization_info();
             printf0("                  compute %2.1f%% | memory: %2.1f%% | fan: %2d%% | %4d MHz / %4d MHz | %3d W / %3d W | %d°C / %d°C | %s\n",
@@ -1880,8 +1903,10 @@ int main(int argc, char *argv[]) {
         }
         logger_log_train(&logger, step, model.mean_loss, step_learning_rate, grad_norm);
 
-        // disable the profiler after 3 steps of optimization
         if (step == 3) { cudaProfilerStop(); }
+    
+    printf0("total average iteration time: %f ms\n", total_sum_iteration_time_s / (train_num_batches-1) * 1000);
+
     }
     // add a total average, for optimizations that are only mild improvements (excluding 1st batch as warmup)
     printf0("total average iteration time: %f ms\n", total_sum_iteration_time_s / (train_num_batches-1) * 1000);

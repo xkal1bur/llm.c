@@ -194,3 +194,11 @@ OMP_NUM_THREADS=8 ./train_gpt2
 ```
 
 Para ejecutr de forma secuencial, simplemente obviar ```-fopenmp``` y ```OMP_NUM_THREADS```.
+
+
+## Gráficas
+
+![Tiempo promedio por step por cantidad de hilos.](metrics_and_plots/avg_computation_time_with_gpu.png)
+
+![GFLOP/s promedio por step por cantidad de hilos.](metrics_and_plots/gflops_per_step_vs_threads.png)
+![Speedup por step por cantidad de hilos.](metrics_and_plots/speedup_vs_threads.png)
