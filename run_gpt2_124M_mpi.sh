@@ -16,7 +16,7 @@ host4="m4"
 # Otherwise, we need to copy the binary to all nodes.
 scp -r $binary_path $USER@$host2:$binary_path
 scp -r $binary_path $USER@$host3:$binary_path
-#scp -r $binary_path $USER@$host4:$binary_path
+scp -r $binary_path $USER@$host4:$binary_path
 
 # Use this for NCCL debugging if you run into issues
 #export NCCL_DEBUG=INFO
@@ -32,15 +32,15 @@ export NCCL_SOCKET_IFNAME=eno2
 export OMPI_MCA_btl_tcp_if_include=eno2
 export NCCL_P2P_LEVEL=PXB
 
-mpirun -np 2 --host $host1:1,$host2:1 \
+mpirun -np 4 --host $host1:1,$host2:1,$host3:1,$host4:1 \
     $binary_path \
     -i "$train_data_path" \
     -j "$val_data_path" \
     -o $out_dir \
     -v 20 -s 0 -g 64 \
     -h 0 \
-    -b 2 -t 256 \
-    -d 1024 \
+    -b 4 -t 256 \
+    -d 4096 \
     -r 0 \
     -z 0 \
     -c 0.0 \
