@@ -2031,7 +2031,7 @@ int main(int argc, char *argv[]) {
             }
             dataloader_next_batch(&train_loader);
             
-            // Measure forward pass time (pure computation)
+            // Medir el tiempo de forward pass (computación pura)
             cudaCheck(cudaEventRecord(comm_start));
             gpt2_forward(&model, train_loader.inputs, B, T);
             cudaCheck(cudaEventRecord(comm_end));
@@ -2059,14 +2059,14 @@ int main(int argc, char *argv[]) {
             float grad_clip = 1.0f;
             float grad_scale = (grad_norm > grad_clip) ? grad_clip / grad_norm : 1.0f;
 
-            // Measure optimizer update time (includes AllGather communication for ZeRO-1)
+            // Medir el tiempo para hacer optimizer update (incluye AllGather comunicación para ZeRO-1)
             cudaCheck(cudaEventRecord(comm_start));
             gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, grad_scale, step+1, &multi_gpu_config);
             cudaCheck(cudaEventRecord(comm_end));
             cudaCheck(cudaEventSynchronize(comm_end));
             float update_total_time;
             cudaCheck(cudaEventElapsedTime(&update_total_time, comm_start, comm_end));
-            computation_time_ms += update_total_time; // Note: Pure NCCL time is measured separately inside gpt2_update
+            computation_time_ms += update_total_time; // Nota: La comunicación NCCL se mide por separado dentro de gpt2_update
         }
 
         cudaCheck(cudaEventRecord(end));
