@@ -7,11 +7,11 @@ Integrantes:
 
 ## Introducción
 
-Este proyecto se centra en la paralelización del entrenamiento de un Modelo de Lenguaje Grande (LLM) GPT-2, utilizando: `train_gpt2.c` para entornos de CPU con paralelismo OpenMP, y `train_gpt2.cu` para entornos de GPU con paralelismo CUDA y soporte distribuido usando MPI.
+Este proyecto se centra en la paralelización del entrenamiento de un Modelo de Lenguaje Grande (LLM) GPT-2, utilizando: `train_gpt2.c` para entornos de CPU con paralelismo OpenMP, y `train_gpt2_3.cu` para entornos de GPU con paralelismo CUDA y soporte distribuido usando MPI.
 
 La versión `train_gpt2.c` implementa el *forward* y *backward pass* de la arquitectura GPT-2 en C puro usando directivas OpenMP, por ejemplo, se usó `#pragma omp parallel for collapse(N)` para paralelizar bucles intensivos en cómputo.
 
-Por otro lado, `train_gpt2.cu` es una adaptación CUDA de la implementación en C. Esta traslada las operaciones a la GPU apoyándose optimizaciones a nivel de GPU. Esta versión incorpora la integración con MPI (`MPI_Init`, `MPI_Finalize`) y la biblioteca NCCL (NVIDIA Collective Communications Library) para la comunicación colectiva y la reducción de gradientes (`multi_gpu_async_reduce_gradient`). Esto permite el entrenamiento distribuido del modelo en múltiples GPUs y nodos, mejorando su escalabilidad en el training.
+Por otro lado, `train_gpt2_3.cu` es una adaptación CUDA de la implementación en C. Esta traslada las operaciones a la GPU apoyándose optimizaciones a nivel de GPU. Esta versión incorpora la integración con MPI (`MPI_Init`, `MPI_Finalize`) y la biblioteca NCCL (NVIDIA Collective Communications Library) para la comunicación colectiva y la reducción de gradientes (`multi_gpu_async_reduce_gradient`). Esto permite el entrenamiento distribuido del modelo en múltiples GPUs y nodos, mejorando su escalabilidad en el training.
 
 ## Código/PRAM
 
@@ -19,7 +19,7 @@ El código es un *fork* del repositorio [llm.c](https://github.com/karpathy/llm.
 
 ### GPU
 
-Se migró la lógica de entrenamiento a la GPU implementando **CUDA C++** en `train_gpt2.cu`.  Las operaciones costosas se ejecutan como *kernels* dedicados o mediante bibliotecas aceleradas (cuBLASLt / cuDNN), y la comunicación entre múltiples GPUs se realiza con **NCCL**.
+Se migró la lógica de entrenamiento a la GPU implementando **CUDA C++** en `train_gpt2_3.cu`.  Las operaciones costosas se ejecutan como *kernels* dedicados o mediante bibliotecas aceleradas (cuBLASLt / cuDNN), y la comunicación entre múltiples GPUs se realiza con **NCCL**.
 
 Definimos las variables:
 
@@ -194,7 +194,7 @@ Se calculó el tiempo que tarda un step (un step considera el forward y backward
 
 
 ### GFLOP/s promedio por step vs. cantidad de hilos
-Los GFLOP/s se calcularon como el número de operaciones de punto flotante realizadas por segundo durante el entrenamiento. Para ello, fue necesario conocer la cantidad de operaciones de punto flotante que sucede en cada step del entrenamiento. Esta cantidad ya está definida por la arquitectura del Transformer (el código original ya lo tenía), y está en la variable ```flops_per_step``` en la función ```gpt2_estimate_mfu``` de ```train_gpt2.cu```. Se graficó el promedio de GFLOP/s por step contra la cantidad de hilos utilizados.
+Los GFLOP/s se calcularon como el número de operaciones de punto flotante realizadas por segundo durante el entrenamiento. Para ello, fue necesario conocer la cantidad de operaciones de punto flotante que sucede en cada step del entrenamiento. Esta cantidad ya está definida por la arquitectura del Transformer (el código original ya lo tenía), y está en la variable ```flops_per_step``` en la función ```gpt2_estimate_mfu``` de ```train_gpt2_3.cu```. Se graficó el promedio de GFLOP/s por step contra la cantidad de hilos utilizados.
 ![GFLOP/s promedio por step por cantidad de hilos.](cpu_metrics_and_plots/gflops_per_step_vs_threads.png)
 
 ### Speedup por step vs. cantidad de hilos
