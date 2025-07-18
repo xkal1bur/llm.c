@@ -81,7 +81,6 @@ for (int step = 0 to S) do {
 }
 ```
 
-
 ### CPU
 Se utilizaron directivas OMP en el proyecto para las secciones de cómputo más pesadas, aprovechando el paralelismo a nivel de CPU sin modificar demasiado la lógica base del modelo. A continuación, se resume cómo y por qué se hizo:
 
@@ -155,16 +154,39 @@ for (int step = 0 to S) do {
 }
 ```
 
+### FLOPs
+
+Las operaciones de punto flotante (FLOPs) se calcularon según lo mencionado en el paper [Scaling Laws for Neural Language Models
+](https://arxiv.org/pdf/2001.08361). En la sección 2.1 estiman que los FLOPs por token en el *forward pass* es de 2N + 2LCT, donde N es el número parámetros entrenables, L es el número de capas, C es el número de canales y T es la longitud de la secuencia. Para el *backward pass*, se estima que los FLOPs son aproximadamente 2 veces los del *forward pass*.
+
+Como N es el término dominante (en este caso son 124M), podemos simplificar la estimación de FLOPs por token a aproximadamente 6N. En una iteración se procesan **B*T** tokens, por lo que el total de FLOPs por iteración es aproximadamente **6NBT**.
+
 ## Aportes Adicionales
 
 Durante el desarrollo de este proyecto, se realizaron los siguientes aportes significativos a la base de código original:
 
+* **Adaptación del Código en C para Ejecución Secuencial**: se modificó el código en C (para CPU) para que pudiera ejecutarse de forma secuencial. Esto fue necesario para la comparación de rendimiento entre la versión paralelizada y la secuencial, permitiendo una evaluación (con speedup, eficiencia, etc.) más precisa de las mejoras obtenidas con la paralelización.
 * **Registro de Métricas de Rendimiento**: Guardamos datos en archivos `.csv` para permitir el análisis de la escalabilidad del modelo. 
 * **Análisis y Aplicación de Modelos PRAM**: 
     * Se identificó el uso de un modelo **CREW (Concurrent Read, Exclusive Write)** en operaciones como `matmul_forward` o `layernorm_forward`, donde múltiples elementos de salida pueden calcularse de forma independiente mientras leen datos de entrada compartidos.
     * Se reconoció un modelo **CRCW (Concurrent Read, Concurrent Write)** en la acumulación de gradientes, donde varios procesadores pueden intentar escribir en la misma ubicación de memoria, requiriendo una regla de resolución de conflictos (como la suma aditiva de gradientes).
 
-## Ejecución con OMP
+## Especificaciones de hardware
+
+### CPU
+- Lenovo ThinkStation P330
+- 16 procesadores lógicos
+
+### GPU
+Experimentación multi-GPU:
+- Nvidia RTX 3090
+- 10,496 Cuda Cores
+
+Experimentación multi-nodo:
+- Nvidia Quadro P4000
+- 1792 Cuda Cores
+
+## Ejecución en CPU
 
 Para ejecutar ```train_gpt2.c``` usando OMP, primero obtener el dataset de Shakespeare.
 
@@ -173,34 +195,42 @@ chmod u+x ./dev/download_starter_pack.sh
 ./dev/download_starter_pack.sh
 ```
 
-Luego, compilar el código y ejecutar, especificando el número de hilos, Por ejemplo, para 8 hilos, número de batches 4 y folder de outputs "my_outputs":
+Luego, compilar el código y ejecutar, especificando el número de hilos, Por ejemplo, para 8 hilos, número de batches 4 y folder de outputs ```my_outputs/```:
 
 ```bash
 gcc -O2  -fopenmp train_gpt2.c -o train_gpt2 -lm
 OMP_NUM_THREADS=8 ./train_gpt2 4 my_outputs
 ```
 
-Para ejecutr de forma secuencial, simplemente obviar ```-fopenmp``` y ```OMP_NUM_THREADS```.
+Para ejecutar de forma secuencial, simplemente obviar ```-fopenmp``` y ```OMP_NUM_THREADS```.
 
 
-### Gráficas
+### Resultados
 
-Debido a la complejidad del cálculo de la cantidad de threads utilizados en el entrenamiento con GPU, utilizamos el placeholder 32 para representar la cantidad de hilos en las gráficas. Esto se debe a que el entrenamiento con GPU no se basa en un número fijo de hilos como en CPU, sino que utiliza una arquitectura de hilos más compleja y dinámica; esto está definido en los archivos ```llmc/*.cuh```.
+Para la experimentación con CPU, se probó con tamaño variable de *batch* (equivalente a aumentar el tamaño del problema) y número de hilos. Se utilizaron *batch sizes* de 4, 8, y 16. Se utilizaron 2, 4, 8 y 16 hilos para la paralelización, adicional a la ejecución secuencial.
+
+**Tiempo de ejecución vs. cantidad de hilos**
+
+Se midió el tiempo que toma cada iteración del entrenamiento y se promedió para cada configuración de hilos y batches. A continuación, se muestra el gráfico de tiempo promedio por iteración en función del número de hilos:
+
+![Tiempo de ejecución vs. cantidad de hilos](cpu_metrics_and_plots\lab_metrics\average_iteration_time.png)
+
+El tiempo disminuye de forma significativa hasta los 8 hilos; a partir de 16 hilos el tiempo de ejecución se estabiliza, lo que indica el programa no se beneficia mucho de aumentar la paralelización. Probablemente la sobrecarga de gestión de hilos (forking, joining, asignación de tareas, sincronización, etc.) puede contrarrestar las ganancias de paralelización.
 
 
-### Tiempo promedio por step vs. cantidad de hilos
-Se calculó el tiempo que tarda un step (un step considera el forward y backward pass) en promedio, y se graficó contra la cantidad de hilos utilizados. El tiempo en el eje *y* incluye tanto el tiempo de cómputo como el de sincronización.
-![Tiempo promedio por step por cantidad de hilos.](cpu_metrics_and_plots/avg_computation_time_with_gpu.png)
+**Speedup vs. cantidad de hilos; y GFLOP/s vs. cantidad de hilos**
 
+A continuación se muestran las gráficas de *speedup* y *GFLOP/s* en función del número de hilos. El *speedup* se calcula como el tiempo de ejecución secuencial (sin usar directivas OpenMP) dividido por el tiempo de ejecución paralelo. Los GFLOP/s, por otro lado, se calculan como el número de operaciones de punto flotante realizadas dividido por el tiempo de ejecución en segundos.
 
-### GFLOP/s promedio por step vs. cantidad de hilos
-Los GFLOP/s se calcularon como el número de operaciones de punto flotante realizadas por segundo durante el entrenamiento. Para ello, fue necesario conocer la cantidad de operaciones de punto flotante que sucede en cada step del entrenamiento. Esta cantidad ya está definida por la arquitectura del Transformer (el código original ya lo tenía), y está en la variable ```flops_per_step``` en la función ```gpt2_estimate_mfu``` de ```train_gpt2_3.cu```. Se graficó el promedio de GFLOP/s por step contra la cantidad de hilos utilizados.
-![GFLOP/s promedio por step por cantidad de hilos.](cpu_metrics_and_plots/gflops_per_step_vs_threads.png)
+![Speedup vs. cantidad de hilos](cpu_metrics_and_plots\lab_metrics\speedup.png)
+![GFLOP/s vs. cantidad de hilos](cpu_metrics_and_plots\lab_metrics\average_gflops.png)
 
-### Speedup por step vs. cantidad de hilos
+El *speedup* incrementa hasta 8 hilos y luego se estabiliza, lo que indica que la paralelización es efectiva hasta cierto punto.
 
-Finalmente, calculamos el speedup como la razón entre el tiempo promedio por step en la ejecución secuencial y el tiempo promedio por step con múltiples hilos. Se graficó el speedup contra la cantidad de hilos utilizados.
+**Eficiencia vs. cantidad de hilos**
 
-Visualmente se ve proporcional a los GFLOP/s, lo cual es concordante con lo esperado por la teoría.
-![Speedup por step por cantidad de hilos.](cpu_metrics_and_plots/speedup_vs_threads.png)
+La eficiencia se calcula como la división del *speedup* entre la cantidad de hilos. Se observa que la eficiencia disminuye a medida que se incrementa el número de hilos.
 
+Para alcanzar una eficiencia constante, se podría considerar usar un tamaño de *batch* mayor, lo que permitiría aprovechar mejor los recursos de cómputo y reducir la sobrecarga de gestión de hilos.
+
+![Eficiencia vs. cantidad de hilos](cpu_metrics_and_plots\lab_metrics\efficiency.png)
