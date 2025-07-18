@@ -213,7 +213,7 @@ Para la experimentación con CPU, se probó con tamaño variable de *batch* (equ
 
 Se midió el tiempo que toma cada iteración del entrenamiento y se promedió para cada configuración de hilos y batches. A continuación, se muestra el gráfico de tiempo promedio por iteración en función del número de hilos:
 
-![Tiempo de ejecución vs. cantidad de hilos](cpu_metrics_and_plots\lab_metrics\average_iteration_time.png)
+![Tiempo de ejecución vs. cantidad de hilos](cpu_metrics_and_plots/lab_metrics/average_iteration_time.png)
 
 El tiempo disminuye de forma significativa hasta los 8 hilos; a partir de 16 hilos el tiempo de ejecución se estabiliza, lo que indica el programa no se beneficia mucho de aumentar la paralelización. Probablemente la sobrecarga de gestión de hilos (forking, joining, asignación de tareas, sincronización, etc.) puede contrarrestar las ganancias de paralelización.
 
@@ -222,8 +222,8 @@ El tiempo disminuye de forma significativa hasta los 8 hilos; a partir de 16 hil
 
 A continuación se muestran las gráficas de *speedup* y *GFLOP/s* en función del número de hilos. El *speedup* se calcula como el tiempo de ejecución secuencial (sin usar directivas OpenMP) dividido por el tiempo de ejecución paralelo. Los GFLOP/s, por otro lado, se calculan como el número de operaciones de punto flotante realizadas dividido por el tiempo de ejecución en segundos.
 
-![Speedup vs. cantidad de hilos](cpu_metrics_and_plots\lab_metrics\speedup.png)
-![GFLOP/s vs. cantidad de hilos](cpu_metrics_and_plots\lab_metrics\average_gflops.png)
+![Speedup vs. cantidad de hilos](cpu_metrics_and_plots/lab_metrics/speedup.png)
+![GFLOP/s vs. cantidad de hilos](cpu_metrics_and_plots/lab_metrics/average_gflops.png)
 
 El *speedup* incrementa hasta 8 hilos y luego se estabiliza, lo que indica que la paralelización es efectiva hasta cierto punto.
 
@@ -233,4 +233,147 @@ La eficiencia se calcula como la división del *speedup* entre la cantidad de hi
 
 Para alcanzar una eficiencia constante, se podría considerar usar un tamaño de *batch* mayor, lo que permitiría aprovechar mejor los recursos de cómputo y reducir la sobrecarga de gestión de hilos.
 
-![Eficiencia vs. cantidad de hilos](cpu_metrics_and_plots\lab_metrics\efficiency.png)
+![Eficiencia vs. cantidad de hilos](cpu_metrics_and_plots/lab_metrics/efficiency.png)
+
+
+## Ejecución con Multi-GPU 
+
+Para ejecutar el entrenamiento distribuido con múltiples GPUs, se utiliza el archivo `train_gpt2_3.cu` que implementa paralelismo CUDA con soporte MPI y NCCL. La configuración permite escalar el entrenamiento desde 1 hasta 8 GPUs, distribuyendo tanto el cómputo como la comunicación entre dispositivos.
+
+### Configuración y Ejecución
+
+El entrenamiento multi-GPU se ejecuta con diferentes configuraciones de batch size y número de GPUs:
+
+```bash
+# Compilar con soporte CUDA y MPI
+nvcc -O3 -arch=sm_70 -lcublas -lcudnn -lmpi -lnccl train_gpt2_3.cu -o train_gpt2_3
+
+# Ejecutar con diferentes configuraciones
+# 1 GPU,               batch_size, sequence_length, d (definido en .cu)
+mpirun -np 1 ./train_gpt2_3 4  256 1024
+mpirun -np 1 ./train_gpt2_3 8  256 2048
+mpirun -np 1 ./train_gpt2_3 16 256 4096
+
+# 2 GPUs
+mpirun -np 2 ./train_gpt2_3 2  256 1024
+mpirun -np 2 ./train_gpt2_3 4  256 2048
+mpirun -np 2 ./train_gpt2_3 8  256 4096
+
+# 4 GPUs
+mpirun -np 4 ./train_gpt2_3 1 256 1024
+mpirun -np 4 ./train_gpt2_3 2 256 2048
+mpirun -np 4 ./train_gpt2_3 4 256 4096
+
+# 8 GPUs, aqui no puedo poner batchsize = 0.5, solo tenemos las últimas dos mediciones
+mpirun -np 8 ./train_gpt2_3 1 256 2048
+mpirun -np 8 ./train_gpt2_3 2 256 4096
+```
+
+### Análisis de Rendimiento Multi-GPU
+
+#### Speedup vs Número de GPUs
+
+El speedup se calcula como la razón entre el tiempo de ejecución con 1 GPU y el tiempo con múltiples GPUs, la elección de esto fué porque consideramos que usar el tiempo secuencial que es completamente cpu con un solo núcleo sería muy desproporcionado; consideramos la definición de speedup de "". Los resultados muestran una escalabilidad sub-lineal terrible debido a que el tamaño de batch es muy bajo en comparación al tiempo que nos toma sincronizar las gpus.
+
+![Speedup vs número de GPUs para tiempo total.](multi_gpu_metrics_and_plots/speedup_total_time_gpu.png)
+
+#### Speedup para Tiempo de Cómputo Puro
+
+Al analizar únicamente el tiempo de cómputo (excluyendo comunicación), se observa una escalabilidad que si parece tener más sentido. Note el punto azul que falta debido a que no se pudo medir el uso de GPUs con 0.5 de batchsize.
+
+![Speedup vs número de GPUs para tiempo de cómputo.](multi_gpu_metrics_and_plots/speedup_computation_time_gpu.png)
+
+#### Eficiencia vs Número de GPUs
+
+La eficiencia se calcula como el speedup dividido por el número de GPUs, en este caso con el tiempo total. Notamos que cae drásticamente por la notoria dominancia del tiempo de sincronización de GPUs.
+
+![Eficiencia vs número de GPUs para tiempo total.](multi_gpu_metrics_and_plots/efficiency_total_time_gpu.png)
+
+
+#### Eficiencia de Cómputo Puro
+
+La eficiencia considerando solo cómputo muestra una degradación más gradual concordante con la teoría explicada en clase. Esta grafica demuestra que el bottleneck es la sincronización.
+
+![Eficiencia vs número de GPUs para tiempo de cómputo.](multi_gpu_metrics_and_plots/efficiency_computation_time_gpu.png)
+
+
+#### Análisis Comparativo de Configuraciones
+
+Esta gráfica es integral sobre varias métricas de multi-gpu. Las primera fila representa las mediciones de tiempo. El tiempo total, el tiempo de computación, el tiempo de comunicación y el tiempo de comunicación pura. La diferencia entre los dos últimos es cómo se calcula, consideramos que el tiempo de comunicación pura mide mejor las operaciones asíncronas que realiza nccl. Notamos en estas gráficas que el tiempo de comunicación domina, pero tambiénque es en la escala de un segundo, es constante y por lo tanto se quedará igual; si escalaramos el batchsize a más de 8 (la configuración original era de 64 con un sequence lenght de 1024) definitivamente sería escalable el algoritmo.
+
+![Análisis comparativo de rendimiento multi-GPU.](multi_gpu_metrics_and_plots/multi_gpu_performance_analysis.png)
+
+La segunda fila muestra los flops per second, la primera considera el tiempo total (cómputo más comunicación) por lo tanto, ya que la comunicación es dominante en gpu, los gflops de 8 gpus son menores que los de single por este overhead. En los siguientes dos gráficos calculamos los theoretical gflops usando el tiempo de computación solamente; para ambas partes usamos los FLOP calulados en el paper de *scalling laws for LLMS* y también el el archivo *train_gpt2.cu*. El último gráfico solo muestra el comunication overhead que es mayor mietnras más gpus existen, curiosamente es igual en 8 y 4gpus, quiza esto siendo algo relacionado a la librería *nvcc*.
+
+### Conclusiones del Análisis Multi-GPU
+
+1. El principal problema que vimos fué que el tamaño con el que entrenamos fué muy pequeño. 
+2. Esto llevó a que el tiempo de comunicación fuera el dominante en las gráficas.
+3. Escalar la cantidad de batch y/o el sequence length haría que el tiempo de comunicación sea irrelevante contra el de computación y haría nuestro algoritmo escalable. (Esto se demuestra en el paper de [scaling laws](https://arxiv.org/abs/2001.08361))
+4. Al haber hecho estos experimentos con RTX3090 es complicado tener una comparación completamente justa. La cantidad de GLOPS per second esta en el orden de los 100000 mientras que en multi-node (más adelante) es mucho menor
+
+## Ejecución con Multi-Node
+
+El entrenamiento multi-nodo extiende la paralelización más allá de un solo nodo, distribuyendo el entrenamiento a través de múltiples máquinas conectadas por red. Esta configuración introduce desafíos adicionales de comunicación y sincronización que son significativamente más pronunciados que en el escenario multi-GPU.
+
+### Configuración y Ejecución Multi-Nodo
+
+El entrenamiento multi-nodo utiliza MPI para la comunicación entre nodos, manteniendo NCCL para la comunicación intra-nodo:
+
+```bash
+# Compilar con soporte MPI y NCCL
+nvcc -O3 -arch=sm_70 -lcublas -lcudnn -lmpi -lnccl train_gpt2_3.cu -o train_gpt2_3
+
+# Configuraciones de nodos
+# Single Node (1 nodo, múltiples GPUs)
+mpirun -np 1 --hosts=node1:4 ./train_gpt2_3 4 256 1024
+
+# Bi-Node (2 nodos, 2 GPUs por nodo)
+mpirun -np 2 --hosts=node1:2,node2:2 ./train_gpt2_3 2 256 1024
+
+# Tetra-Node (4 nodos, 1 GPU por nodo)
+mpirun -np 4 --hosts=node1:1,node2:1,node3:1,node4:1 ./train_gpt2_3 1 256 1024
+```
+
+### Análisis de Rendimiento Multi-Nodo
+
+#### Speedup vs Número de Nodos
+
+El speedup multi-nodo muestra una degradación más severa que el escenario multi-GPU debido al overhead de comunicación de red debido a que las computadoras del laboratorio a pesar de estar conectadas, realmetne demoran bastante en transferir datos, además usamos el parámetro "zero.cu" = 0, eso hace que tengamos que tener una copia en cada nodo y hacer un reduce scatter de estos fragmentos después de la actualización en backward propagation demora bastante.
+
+![Speedup vs número de nodos para tiempo total.](multi_nodes_metrics_and_plots/speedup_total_time.png)
+
+
+#### Speedup para Tiempo de Cómputo Puro
+
+Al analizar únicamente el tiempo de cómputo, se observa una escalabilidad más razonable. La diferencia con el speedup total confirma que la comunicación de red es el cuello de botella principal. Es notorio que el speedup en cierto momento supera lo esperado, asumiremos que es por la aleatoriedad de las mediciones o algún uso de cache por la gpu.
+
+![Speedup vs número de nodos para tiempo de cómputo.](multi_nodes_metrics_and_plots/speedup_computation_time.png)
+
+
+
+#### Eficiencia vs Número de Nodos
+
+La eficiencia multi-nodo muestra una degradación dramática debido al overhead de comunicación, esperable viendo el speedup anterior
+
+![Eficiencia vs número de nodos para tiempo total.](multi_nodes_metrics_and_plots/efficiency_total_time.png)
+
+#### Eficiencia de Cómputo Puro
+
+La eficiencia computacional muestra una degradación más gradual con el pico por encima en el mismo lugar en el que el speedup fué mayor en gráficos anteriores.
+
+![Eficiencia vs número de nodos para tiempo de cómputo.](multi_nodes_metrics_and_plots/efficiency_computation_time.png)
+
+
+#### Análisis Comparativo de Configuraciones Multi-Nodo
+
+Igual que en el multi-gpu, usamos las mismas gráficas, el análisis es similar; algo rescatable es que los gflops teóricos aquí están en el rango de los 12000 que es menor que los 200000 que teníamos con la RTX3090. Por lo demás, el análisis permanece igual.
+
+![Análisis comparativo de rendimiento multi-nodo.](multi_nodes_metrics_and_plots/multi_nodes_performance_analysis.png)
+
+
+### Conclusiones del Análisis Multi-Nodo
+
+1. El tiempo de comunicación fuera el dominante en las gráficas, igual que en el multi-gpu pero esta vez por razones diferentes: el tiempo de comunicación es gigantesco (2 min por iteración).
+2. Para problemas de tamaño pequeño, la comunicación de red es prohibitivamente costosa. Para problemas de mayor escala (batch_size >> 64, sequence_length >> 1024), el overhead de comunicación aún parece no viable, ya que hablamos de una escala de 2 minutos por iteración que no es tratable en un centro de entrenamiento formal, sería recomentable conseguir fibra óptica y conexión directa entre los nodos para mejor escalabilidad.
+
